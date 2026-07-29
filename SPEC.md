@@ -27,7 +27,7 @@ CATHelper 采用"**底座 + 上层特性**"的分层架构：
 ├──────────────┼──────────────────────────┼──────────────────┤
 │              ▼                          ▼                    │
 │   底座 — CATMonitor (CATMonitor/)                            │
-│   全栈指标采集 · 健康度评估 · Prometheus 导出 · 故障订阅推送 │
+│   全栈指标采集 · 健康度评估/显式压测 · Prometheus · 故障推送 │
 │   ┌────────┬────────┬────────┬────────┬──────────┬──────────┐ │
 │   │ 健康度 │Web仪表盘│ 能效监控│Prometheus│ faultsub │stragglerout│ │
 │   │ 评估   │         │        │  导出   │ 故障订阅 │ KPI 输出  │ │
@@ -73,7 +73,14 @@ CATMonitor 是 CATHelper 的底座，可独立运行。详细功能规格见 [CA
 - 等级：Excellent (90-100) / Good (75-89) / Warning (60-74) / Critical (0-59)
 - 按 High/Medium 指标阈值扣分，多卡取最差卡
 
-### 2.3 数据输出
+### 2.3 显式健康压测
+
+- Linux 上由用户按需运行 STREAM、HPL、HPCG；普通 health 与 daemon 不自动触发
+- CLI 命令为 `catmonitor health stress run`，本机 Web 提供同一作业的触发、取消与结果展示
+- 达到配置运行窗口且无执行错误时可按通过记录，不要求一定产生最终性能数值
+- 压测结果不直接写入健康总分，但高负载可能使同期实时采集指标和评分发生变化
+
+### 2.4 数据输出
 
 | 方式 | 端口 | 说明 |
 |------|------|------|
@@ -82,7 +89,7 @@ CATMonitor 是 CATHelper 的底座，可独立运行。详细功能规格见 [CA
 | Web 仪表盘 | `:9527` | 独立二进制 `catmonitor-web`，可视化单机健康度与各部件指标 |
 | 能效监控 | `:9527/dfee/` | 能效指标实时图表 SPA |
 
-### 2.4 故障订阅推送（faultsub）— 承上启下
+### 2.5 故障订阅推送（faultsub）— 承上启下
 
 > faultsub 是底座与上层特性衔接的关键模块。它作为 daemon 的 Storage 插件，复用采集管道，对采集到的指标做故障判定并推送事件。
 
@@ -203,7 +210,7 @@ Straggler 是 CATHelper 的第二个上层特性，检测 AI 集群中性能劣�
 
 | 特性 | 状态 | 说明 |
 |------|------|------|
-| CATMonitor 底座 | 已交付 (v0.3.3) | 全栈采集 + 健康度 + Prometheus + 故障订阅 + KPI 输出 |
+| CATMonitor 底座 | 开发分支 | 全栈采集 + 健康度/显式压测 + Prometheus + 故障订阅 + KPI 输出 |
 | Elastic EP | 已交付 (v0.1.0) | 推理卡级弹性容错，已与 CATMonitor 整合 |
 | Straggler 慢节点检测 | 已交付 (v0.2.0) | 两道防线检测，第一道接入 CATMonitor + 回注 faultsub |
 | SGLang 支持 | 规划中 | EEP 后续计划支持 SGLang 框架 |

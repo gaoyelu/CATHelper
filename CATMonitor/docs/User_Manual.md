@@ -101,6 +101,16 @@ health:
   enabled: true             # v0.3.3 起 daemon 不再读取（保留字段，当前不生效）
   interval: 5s              # 同上，daemon 不再周期评估健康度
   weight_scheme: auto      # 仅 `catmonitor health` CLI 使用：auto | cpu_only | accelerated_8card | accelerated_4card
+  stress:
+    enabled: false          # 总开关；普通 health/daemon 不会自动运行
+    web_enabled: false      # Web 提交开关；CLI 不读取此项
+    script_path: features/health/stress/benchmark_check.sh
+    report_path: features/health/stress/data/stress-latest.json
+    default_benchmarks: [stream]
+    benchmarks:
+      stream: { enabled: false, timeout: 1m }
+      hpl: { enabled: false, timeout: 2h }
+      hpcg: { enabled: false, result_dir: "", timeout: 3m }
 
 collection:
   min_priority: low        # low (全采) | medium (跳过 Low) | high (仅 High)——按优先级阈值预过滤采集
@@ -114,6 +124,7 @@ collection:
 | `collectors.*.enabled` / `.interval` | daemon | 各采集器开关与采集周期 |
 | `storage.*` | daemon | JSONL 数据目录、保留时长、轮转策略 |
 | `health.weight_scheme` | `health` CLI | 健康度权重方案；`enabled`/`interval` v0.3.3 起 daemon 不再使用 |
+| `health.stress.*` | `health stress` CLI / Web | 显式压测开关、脚本、报告、项目和最大运行窗口；资产命令全路径由主机脚本维护 |
 | `collection.min_priority` | daemon / collect | 按优先级阈值预过滤采集粒度 |
 
 ### 配置路径
@@ -135,7 +146,7 @@ catmonitor [command] [flags]
 Commands:
   daemon       启动守护进程（持续采集 + Prometheus 导出）— 默认；健康度评估由 health 子命令按需执行
   collect      单次采集所有指标快照
-  health       执行一次健康检查
+  health       执行一次健康检查，或进入 stress 子特性
   list         列出所有已注册采集器
   version      显示版本信息
 
@@ -154,6 +165,7 @@ Flags:
 | 常驻采集 + Prometheus | `catmonitor daemon` |
 | 一次性巡检（指标） | `catmonitor collect -o table` |
 | 一次性健康体检 | `catmonitor health` |
+| 显式运行 STREAM | `catmonitor health stress run --bench stream` |
 | 查看采集器清单 | `catmonitor list` |
 | 查看版本 | `catmonitor version` |
 | Web 仪表盘 | `catmonitor-web`（独立二进制，见 §4） |
@@ -221,7 +233,27 @@ Server Type:    accelerated
   TOTAL      95 / 100  Excellent
 ```
 
-### 3.5 daemon — 守护进程
+### 3.5 health stress — 显式健康压测
+
+压测只支持 Linux，且只由用户显式启动。先按部署机器修改
+`features/health/stress/benchmark_check.sh` 中的 STREAM/HPL/HPCG 资产全路径、
+环境变量和 MPI/NUMA 参数，再在 `health.stress.benchmarks` 中启用对应项目。
+
+```bash
+catmonitor health stress run --help
+catmonitor health stress run --bench stream -c /etc/catmonitor/catmonitor.yaml -o table
+catmonitor health stress run --bench hpcg,hpl -c /etc/catmonitor/catmonitor.yaml -o json
+```
+
+达到 YAML 中最大运行窗口且此前没有执行错误时，报告状态为
+`time_limit_reached` 并按通过聚合；此时允许没有 GFLOPS/带宽等最终数值。
+正常结束时则必须解析到各项目要求的成功标志和数值。普通
+`catmonitor health`、daemon 均不会触发压测。
+
+完整配置、脚本适配和验收步骤见
+[STRESS_TEST_GUIDE.md](../features/health/stress/STRESS_TEST_GUIDE.md)。
+
+### 3.6 daemon — 守护进程
 
 ```bash
 catmonitor daemon                       # 默认配置前台运行
@@ -256,8 +288,9 @@ daemon 启动后：
 
 ### 4.2 页面
 
-- **概览页**（`/`）：整体健康度（总分 + 进度条 + 等级）+ 设备规格面板（点击展开完整规格）+ 各部件状态 + 部件概览卡片（含趋势 sparkline）
+- **概览页**（`/`）：整体健康度（总分 + 进度条 + 等级）+ 最近压测摘要 + 设备规格面板（点击展开完整规格）+ 各部件状态 + 部件概览卡片（含趋势 sparkline）
 - **部件详情页**（`#/<component>`，如 `#/cpu`）：部件得分/扣分项 + 趋势面板（该部件全部历史序列 sparkline）+ 全部指标表
+- **健康压测页**（`#/stress`）：选择通过资产预检的项目、为本次作业缩短超时、启动或取消作业。必须同时启用 `health.stress.enabled` 与 `web_enabled`，且 Web 绑定回环地址
 - **能效监控**（`/dfee/`）：见 §6
 
 ### 4.3 REST API
@@ -268,6 +301,11 @@ daemon 启动后：
 | GET | `/api/collectors` | 采集器注册表元数据 |
 | GET / POST | `/api/config` | 读取 / 更新刷新间隔（热生效 + 持久化到 `runtime.json`） |
 | POST | `/api/refresh` | 请求立即采集 |
+| GET | `/api/health/stress/config` | 压测开关、项目与资产预检结果 |
+| GET | `/api/health/stress/latest` | 当前或最近一次压测报告 |
+| POST | `/api/health/stress/runs` | 启动作业；要求本机同源、JSON 与操作头 |
+| GET | `/api/health/stress/runs/{job_id}` | 查询指定作业 |
+| POST | `/api/health/stress/runs/{job_id}/cancel` | 取消作业；安全约束同上 |
 | GET | `/api/dfee` | 过滤+推导后的能效图表数据（见 §6） |
 
 > 详细设计与扩展机制见 [features/web/Web_SPEC.md](../features/web/Web_SPEC.md)。

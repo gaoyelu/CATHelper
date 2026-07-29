@@ -4,6 +4,17 @@
 
 ---
 
+## Unreleased — health/stress
+
+- 新增 `features/health/stress` Linux 显式压测子特性，支持 STREAM、HPL、HPCG；命令为 `catmonitor health stress run`，普通 health 与 daemon 不会自动触发。
+- CLI 与 Web 共用配置、`stress.Manager`、状态模型和原子 JSON 报告；Web 新增概览摘要、`#/stress` 页面与 `/api/health/stress/*` 作业接口。
+- Web 写操作限制为回环地址和同源请求，并要求 JSON 与显式操作头；压测总开关和 Web 开关默认关闭。
+- STREAM/HPL/HPCG 达到最大运行窗口且此前无执行错误时统一记录 `time_limit_reached` 并按通过聚合，允许没有最终性能值。
+- 主机资产全路径、环境变量和 MPI/NUMA 参数统一由 `benchmark_check.sh` 维护；开源模板不包含节点地址、私有路径或实测基准值。
+- 新增 health/stress README、SPEC、DESIGN 与通用测试指南，并补充 CLI、Web 和脚本单元/模拟测试。
+
+---
+
 ## v0.3.3
 
 | 项目 | 说明 |

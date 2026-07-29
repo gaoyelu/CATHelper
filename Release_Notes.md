@@ -4,6 +4,15 @@
 
 ---
 
+## Unreleased — CATMonitor health/stress
+
+- CATMonitor 底座新增 Linux STREAM/HPL/HPCG 显式健康压测，入口为 `catmonitor health stress run`，普通健康检查和 daemon 不会自动运行高负载作业。
+- Web 仪表盘新增最近压测摘要、压测页面和本机受控作业 API；CLI 与 Web 共用状态、报告和执行管理器。
+- 配置统一位于 `health.stress`；主机资产路径、环境变量与 MPI/NUMA 参数由部署机器的 `benchmark_check.sh` 维护。
+- 新增特性 README、SPEC、DESIGN、通用测试指南及单元/模拟测试；环境专用节点信息不进入开源仓库。
+
+---
+
 ## v0.2.0
 
 | 项目 | 说明 |

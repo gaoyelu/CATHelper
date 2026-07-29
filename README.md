@@ -16,7 +16,7 @@
 CATHelper/
 ├── CATMonitor/            # 底座：全栈指标采集、健康度评估、Prometheus 导出守护进程
 │   ├── internal/          #   采集核心 + 7 部件采集器 + 14 来源层
-│   ├── features/          #   健康度 / Web 仪表盘 / 能效监控 / Prometheus 导出 / 故障订阅推送 / KPI 输出
+│   ├── features/          #   健康度与显式压测 / Web / 能效 / Prometheus / 故障订阅 / KPI 输出
 │   └── configs/           #   catmonitor.yaml + metrics.yaml
 └── feature/
     ├── elastic-ep/        # 上层特性：推理大EP卡级弹性容错（EEP）
@@ -30,7 +30,7 @@ CATHelper/
 
 ### 底座 — [CATMonitor](CATMonitor/)
 
-服务器运行指标采集、健康度评估与 Prometheus 导出守护进程。覆盖 CPU / 内存 / 硬盘 / GPU / NPU / 网卡 / 机箱共 7 个部件、204 个指标；输出 JSONL 落盘 + Prometheus `/metrics`；提供故障信息订阅/推送机制（`faultsub`）供上层特性获取故障事件。**可独立运行，也可作为 CATHelper 的一部分。** 构建用法见 [CATMonitor/README.md](CATMonitor/README.md)，使用手册见 [CATMonitor/docs/User_Manual.md](CATMonitor/docs/User_Manual.md)。
+服务器运行指标采集、健康度评估与 Prometheus 导出守护进程。覆盖 CPU / 内存 / 硬盘 / GPU / NPU / 网卡 / 机箱共 7 个部件、204 个指标；提供 Linux 上显式触发的 STREAM/HPL/HPCG 健康压测；输出 JSONL 落盘 + Prometheus `/metrics`；提供故障信息订阅/推送机制（`faultsub`）供上层特性获取故障事件。**可独立运行，也可作为 CATHelper 的一部分。** 构建用法见 [CATMonitor/README.md](CATMonitor/README.md)，使用手册见 [CATMonitor/docs/User_Manual.md](CATMonitor/docs/User_Manual.md)。
 
 > CATMonitor 子目录为其主干快照，保持独立 Go module（`github.com/Computing-Availability-Tools/CATMonitor`），可在 `CATMonitor/` 内独立 `go build`/`make build`。
 

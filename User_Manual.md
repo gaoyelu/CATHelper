@@ -115,6 +115,7 @@ EEP 为 Python + vLLM 补丁形态，无需 Go 构建。按 [feature/elastic-ep/
 catmonitor daemon                 # 守护进程（持续采集 + Prometheus :9100）
 catmonitor collect -o table        # 单次采集快照
 catmonitor health                  # 单次健康检查
+catmonitor health stress run --bench stream  # 显式 Linux 压测（需先配置）
 catmonitor list                    # 采集器清单
 catmonitor version                 # 版本
 ```
@@ -386,6 +387,10 @@ kill -9 <worker_pid>
 | `server.type` | `auto`（自动判定服务器类型） |
 | `collectors.*.enabled` / `.interval` | 各采集器开关与周期 |
 | `storage.data_dir` / `max_file_age` / `rotation` | JSONL 数据目录、保留时长、轮转 |
+| `health.stress.enabled` | 显式压测总开关（默认 false） |
+| `health.stress.web_enabled` | Web 提交开关（默认 false；CLI 不要求开启） |
+| `health.stress.script_path` / `report_path` | 主机适配脚本与最近报告路径 |
+| `health.stress.benchmarks.*` | STREAM/HPL/HPCG 启用状态与最大运行窗口 |
 | `collection.min_priority` | `low`（全采，默认）/ `medium` / `high` |
 | `faultsub.enabled` | 是否启用故障订阅推送（默认 false） |
 | `faultsub.rest_addr` | 订阅 REST API 监听地址（默认 `:9101`） |
