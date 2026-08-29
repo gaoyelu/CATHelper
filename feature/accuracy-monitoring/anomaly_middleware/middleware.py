@@ -327,6 +327,8 @@ class AnomalyMiddleware:
         self._vocab_size: Optional[int] = None
         self._runner: Optional[DetectorRunner] = None
         self._anomaly_store: Any = None
+        self._monitor_rate = self.config.monitor_rate
+        self.metrics.set_monitor_rate(self._monitor_rate)
 
         if not self.config.enabled:
             # ② enabled=False → skip all checks, pure passthrough
@@ -390,6 +392,17 @@ class AnomalyMiddleware:
         if method == "GET" and path == self.config.metrics_path:
             await self._serve_metrics(send)
             return
+        # 配置端点（内联，GET 查询 / POST 更新）
+        if path == self.config.config_path:
+            if method == "POST":
+                await self._handle_config_update(scope, receive, send)
+                return
+            elif method == "GET":
+                await self._serve_config(send)
+                return
+            else:
+                await self.app(scope, receive, send)
+                return
         # 降级或非目标 → 透传（不读 body）
         if not self.config.enabled:
             await self.app(scope, receive, send)
@@ -398,7 +411,7 @@ class AnomalyMiddleware:
             await self.app(scope, receive, send)
             return
         # 采样：未中 → 纯透传（不读 body、不注入、不恢复、不检测）
-        if random.random() >= self.config.monitor_rate:
+        if random.random() >= self._monitor_rate:
             await self.app(scope, receive, send)
             return
         # 选中：读 body
@@ -454,6 +467,51 @@ class AnomalyMiddleware:
         await send(
             {"type": "http.response.body", "body": body, "more_body": False}
         )
+
+    async def _send_json(self, send, status: int, obj: dict) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        headers = [
+            [b"content-type", b"application/json; charset=utf-8"],
+            [b"content-length", str(len(body)).encode("latin-1")],
+        ]
+        await send(
+            {"type": "http.response.start", "status": status, "headers": headers}
+        )
+        await send(
+            {"type": "http.response.body", "body": body, "more_body": False}
+        )
+
+    async def _serve_config(self, send) -> None:
+        await self._send_json(send, 200, {"monitor_rate": self._monitor_rate})
+
+    async def _handle_config_update(self, scope, receive, send) -> None:
+        raw = await _read_all_body(receive)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            await self._send_json(send, 400, {"error": "invalid JSON body"})
+            return
+        if not isinstance(data, dict):
+            await self._send_json(send, 400, {"error": "body must be a JSON object"})
+            return
+        if "monitor_rate" not in data:
+            await self._send_json(send, 400, {"error": "missing 'monitor_rate' field"})
+            return
+        value = data["monitor_rate"]
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            await self._send_json(send, 400, {"error": "monitor_rate must be a number"})
+            return
+        if not (0.0 <= rate <= 1.0):
+            await self._send_json(send, 400, {
+                "error": f"monitor_rate must be 0.0-1.0, got: {rate}"
+            })
+            return
+        self._monitor_rate = rate
+        self.metrics.set_monitor_rate(rate)
+        logger.info("monitor_rate 已更新: %s", rate)
+        await self._send_json(send, 200, {"monitor_rate": rate})
 
     def shutdown(self) -> None:
         for t in list(self._pending_tasks):
