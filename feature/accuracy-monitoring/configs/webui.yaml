@@ -1,11 +1,7 @@
-server:
-  host: 127.0.0.1
-  port: 9090
-
 auth:
   username: admin
   password: admin@123
-  token_ttl_hours: 1
+  token_ttl_hours: 24
 
 poll:
   interval_seconds: 3
