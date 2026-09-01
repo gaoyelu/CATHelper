@@ -21,7 +21,9 @@ from .extractor import (
     OriginalParams,
     SSEStreamProcessor,
     extract_chat_response,
+    extract_chat_text_tokenids,
     extract_completions_response,
+    extract_completions_text_tokenids,
     inject_params,
     save_original_params,
     strip_chat_response,
@@ -137,6 +139,8 @@ class ResponseInterceptor:
         self._detection_scheduled = False
         self._detection_results: List[Tuple[np.ndarray, np.ndarray]] = []
         self._choice_texts: List[Any] = []
+        self._choice_text_tokenids: List[List[int]] = []
+        self._choice_reasoning_contents: List[Any] = []
 
     async def __call__(self, message: dict) -> None:
         t = message.get("type")
@@ -229,10 +233,17 @@ class ResponseInterceptor:
                     )
                 else:
                     self._choice_texts.append(c.get("text"))
+        ch = choices if isinstance(choices, list) else []
         if self._ctx.is_chat:
             self._detection_results = extract_chat_response(
                 data, self._ctx.top_logprobs
             )
+            self._choice_text_tokenids = extract_chat_text_tokenids(data)
+            self._choice_reasoning_contents = [
+                (c.get("message") or {}).get("reasoning_content")
+                if isinstance(c, dict) else None
+                for c in ch
+            ]
             strip_chat_response(
                 data, self._ctx.orig, self._resolver,
             )
@@ -240,6 +251,8 @@ class ResponseInterceptor:
             self._detection_results = extract_completions_response(
                 data, self._ctx.top_logprobs
             )
+            self._choice_text_tokenids = extract_completions_text_tokenids(data)
+            self._choice_reasoning_contents = [None] * len(ch)
             strip_completions_response(
                 data, self._ctx.orig, self._resolver,
                 recompute_text_offset=True,
@@ -251,6 +264,18 @@ class ResponseInterceptor:
         if self._is_streaming:
             return self._sse.get_choice_texts() if self._sse is not None else []
         return list(self._choice_texts)
+
+    def get_choice_text_tokenids(self) -> List[List[int]]:
+        """per-choice 实际生成 token_id 序列（非流式取 _choice_text_tokenids；流式取 SSE 累积）。"""
+        if self._is_streaming:
+            return self._sse.get_choice_text_tokenids() if self._sse is not None else []
+        return list(self._choice_text_tokenids)
+
+    def get_choice_reasoning_contents(self) -> List[Any]:
+        """per-choice 思维链文本（非流式取 _choice_reasoning_contents；流式取 SSE 累积）。"""
+        if self._is_streaming:
+            return self._sse.get_choice_reasoning_contents() if self._sse is not None else []
+        return list(self._choice_reasoning_contents)
 
     async def _send_start(self, final: bytes) -> None:
         msg = self._start_msg
@@ -297,6 +322,8 @@ class ResponseInterceptor:
                 anomaly_store=self._anomaly_store,
                 prompt=self._ctx.prompt,
                 texts=self.get_choice_texts(),
+                text_tokenids=self.get_choice_text_tokenids(),
+                reasoning_contents=self.get_choice_reasoning_contents(),
             )
         except RuntimeError as exc:
             # 无运行事件循环等：记录后跳过（不影响客户端）
