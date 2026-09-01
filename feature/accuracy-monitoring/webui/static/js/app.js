@@ -366,29 +366,29 @@
       );
     }
 
-    // 按模型累计异常柱状图（固定柱宽 + 等间距自适应）
-    var modelEntries = Object.entries(s.by_model || {}).sort(function (a, b) {
+    // 按实例累计异常柱状图（固定柱宽 + 等间距自适应）
+    var instanceEntries = Object.entries(s.by_instance || {}).sort(function (a, b) {
       return b[1] - a[1];
     });
-    if (modelEntries.length === 0 || !modelChart) {
+    if (instanceEntries.length === 0 || !modelChart) {
       $('model-chart').classList.add('hidden');
       $('model-empty').classList.remove('hidden');
     } else {
       $('model-chart').classList.remove('hidden');
       $('model-empty').classList.add('hidden');
-      var layout = modelBarLayout(modelChart, modelEntries.length);
+      var layout = modelBarLayout(modelChart, instanceEntries.length);
       modelChart.setOption(
         {
           tooltip: { trigger: 'axis' },
           grid: { left: 40, right: 16, top: 24, bottom: 40 },
           xAxis: {
             type: 'category',
-            data: modelEntries.map(function (m) {
+            data: instanceEntries.map(function (m) {
               return m[0];
             }),
             axisLabel: {
               interval: 0,
-              rotate: modelEntries.length > 8 ? 40 : modelEntries.length > 4 ? 30 : 0,
+              rotate: instanceEntries.length > 8 ? 40 : instanceEntries.length > 4 ? 30 : 0,
             },
           },
           yAxis: { type: 'value', minInterval: 1 },
@@ -398,7 +398,7 @@
               barWidth: layout.barWidth,
               barCategoryGap: layout.barCategoryGap,
               itemStyle: { color: '#2563eb', borderRadius: [3, 3, 0, 0] },
-              data: modelEntries.map(function (m) {
+              data: instanceEntries.map(function (m) {
                 return m[1];
               }),
             },
@@ -779,7 +779,7 @@
     var ok = window.confirm(
       '确认删除实例 ' +
         inst.name +
-        '？\n删除将清除该实例的事件 / 告警 / 趋势数据（不可恢复）。'
+        '？\n删除将清除该实例的事件 / 告警 / 趋势 / 全局累计统计数据（不可恢复）。'
     );
     if (!ok) return;
     var r = await api('/api/instances/' + encodeURIComponent(inst.name), { method: 'DELETE' });
@@ -789,7 +789,7 @@
         closeDetail();
         return;
       }
-      refreshInstances();
+      refreshNow();
     } else {
       var msg = r.data && r.data.detail ? r.data.detail : '删除失败';
       showToast(msg, true);

@@ -159,12 +159,6 @@ class Store:
         self._stats: Dict[str, InstanceStats] = {}
         self._next_event_id = 1
         self._next_alert_id = 1
-        # 全局累计聚合（跨实例）
-        self.requests_total = 0
-        self.anomalies_total = 0
-        self.errors_total = 0
-        self.by_type: Dict[str, int] = {t: 0 for t in ILL_TYPES}
-        self.by_model: Dict[str, int] = {}
         self.detection_duration: Optional[Dict[str, float]] = None
 
     # ------------------------------------------------------------------ #
@@ -238,13 +232,6 @@ class Store:
             )
         self._prune_trend_events(now)
 
-        self.requests_total += delta.requests
-        self.errors_total += delta.errors
-        self.anomalies_total += delta.anomalies_total
-        for t, n in delta.by_type.items():
-            self.by_type[t] += n
-        for m, n in delta.by_model.items():
-            self.by_model[m] = self.by_model.get(m, 0) + n
         if delta.duration is not None:
             self.detection_duration = delta.duration
 
@@ -444,15 +431,6 @@ class Store:
                         st.by_model.pop(m, None)
                     else:
                         st.by_model[m] = base - n
-            self.anomalies_total = max(0, self.anomalies_total - old.anomalies)
-            for t, n in old.by_type.items():
-                self.by_type[t] = max(0, self.by_type[t] - n)
-            for m, n in old.by_model.items():
-                base = self.by_model.get(m, 0)
-                if base <= n:
-                    self.by_model.pop(m, None)
-                else:
-                    self.by_model[m] = base - n
             # 移除旧导入事件
             self.events.remove_where(
                 lambda e: e.instance == instance
@@ -481,12 +459,6 @@ class Store:
             imp.by_type[e.ill_type] += 1
             imp.by_model[e.model] = imp.by_model.get(e.model, 0) + 1
 
-        self.anomalies_total += len(anomaly_events)
-        for t, n in imp.by_type.items():
-            self.by_type[t] += n
-        for m, n in imp.by_model.items():
-            self.by_model[m] = self.by_model.get(m, 0) + n
-
         self._imported[instance] = imp
         return cleared
 
@@ -506,18 +478,29 @@ class Store:
         self._stats.pop(name, None)
 
     def summary(self) -> Dict[str, Any]:
-        online = sum(1 for st in self._stats.values() if st.state == "online")
-        offline = sum(1 for st in self._stats.values() if st.state == "offline")
-        paused = sum(1 for st in self._stats.values() if st.state == "paused")
-        rate = self.anomalies_total / self.requests_total if self.requests_total else 0.0
+        stats = list(self._stats.values())
+        requests = sum(st.requests for st in stats)
+        anomalies = sum(st.anomalies for st in stats)
+        errors = sum(st.errors for st in stats)
+        by_type: Dict[str, int] = {t: 0 for t in ILL_TYPES}
+        for st in stats:
+            for t, n in st.by_type.items():
+                by_type[t] += n
+        by_instance: Dict[str, int] = {
+            st.name: st.anomalies for st in stats if st.anomalies > 0
+        }
+        online = sum(1 for st in stats if st.state == "online")
+        offline = sum(1 for st in stats if st.state == "offline")
+        paused = sum(1 for st in stats if st.state == "paused")
+        rate = anomalies / requests if requests else 0.0
         return {
-            "requests": self.requests_total,
-            "anomalies": self.anomalies_total,
+            "requests": requests,
+            "anomalies": anomalies,
             "anomaly_rate": round(rate, 6),
-            "errors": self.errors_total,
-            "by_type": dict(self.by_type),
-            "by_model": dict(self.by_model),
-            "instances": {"total": len(self._stats), "online": online, "offline": offline, "paused": paused},
+            "errors": errors,
+            "by_type": by_type,
+            "by_instance": by_instance,
+            "instances": {"total": len(stats), "online": online, "offline": offline, "paused": paused},
             "detection_duration": self.detection_duration,
             "updated_at": NOW(),
         }
