@@ -16,7 +16,7 @@
 | `VLLM_ANOMALY_ENABLED=0` 仍启动成功 | 总开关关闭 = 纯透传模式（设计行为） | 需要检测则设回 `1` 并重启 |
 | `aclInit` error code 107001 + `Invalid device ID` | `ASCEND_RT_VISIBLE_DEVICES` 填了 **npu-smi 物理卡号**（该 env 只认逻辑号 0..N-1）；真实事故：容器挂 davinci2/5（逻辑 0/1），填物理 5 崩溃 | 跑 probe 取 `npu_logical_count` 与 `npu_davinci` 映射，改填逻辑号重新拉起；deploy 现已对该值做 fail-fast（rc=3） |
 | `EngineCore failed to start` / `Engine core initialization failed` | 引擎核心初始化失败，根因看其上方首个 Traceback（OOM/卡号/包缺失等） | 按 Traceback 首因对照本表修复；verify 现已把该特征列入致命模式库（rc=3 即返，不再白等满窗口） |
-| ansible 投递失败（连接/认证/权限拒绝） | 管理节点→计算节点通道问题，非中间件问题 | 核对 inventory/SSH/become；与精度监控无关 |
+| ansible 投递失败（连接/认证/权限拒绝） | 管理节点→计算节点通道问题，非中间件问题 | 核对 inventory/`-c paramiko` 传输/档案凭证字段（ssh_user/密码文件）/become；paramiko 缺失由用户安装（铁律 9）；与精度监控无关 |
 
 ## 推理期"看不到数据"排查表（有序判读）
 
@@ -58,7 +58,7 @@ probe 现已尽力解析 `npu-smi info`：输出 `npu_ids`（物理卡号）/`np
 |---|---|
 | `v1_http_code` 非 200 | 未挂 `--middleware`（单机）或 proxy 未挂检测（PD 模式 A/B/C）；或 metrics 路径被改 |
 | `v2_counters_found=false` | 端点可达但不是异常指标 → 大概率打到 vLLM 自带 `/metrics`，核对 metrics_path |
-| `monitor_rate` ≤ 0 | 采样率为 0，永不检测——确认是否符合预期，调参需确认后 `POST /anomaly/config` |
+| `monitor_rate` ≤ 0 | 采样率为 0，永不检测——确认是否符合预期，调参按用户指令直接 `POST /anomaly/config`（用户指令即确认） |
 | `v3_header=false`（reason=header missing） | 未命中采样（rate<1 时部分请求无请求头属正常，可多发几条）或该请求未被拦截 |
 | `v4_growth` < 1 | 请求没进检测链路 → 指向/端口错误；或 `--no-request` 模式下无增长基线 |
 

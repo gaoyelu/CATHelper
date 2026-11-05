@@ -5,7 +5,7 @@
 # bind 默认 0.0.0.0（用户确认）；9092 被无关进程占用时不擅杀，顺位 +1 重试
 # （至多 +20），成功拉起后回显实际端口；控制节点无代码 → Agent 经 ansible 从被测
 # 节点拷回最小集（webui/ + configs/）后再 start；实例端口对控制节点不可达（安全组）时
-# 先经 tunnel 子命令建 ssh 隧道，再以隧道地址注册——webui 靠 HTTP 轮询实例，
+# 先经 tunnel 子命令建 paramiko 隧道，再以隧道地址注册——webui 靠 HTTP 轮询实例，
 # 注册一个不可达的 URL 只会得到永久离线卡片。
 #
 # 用法:
@@ -16,17 +16,18 @@
 #                             [--register-script PATH]
 #   webui_control.sh tunnel   --ssh-host H --target-port T [--ssh-port P] [--ssh-user U]
 #                             [--local-port L] [--local-bind B] [--pass-file F | --key-path K]
-#                             # 本地端默认绑 0.0.0.0（用户决策，2026-10-28）
+#                             # 本地端默认绑 0.0.0.0（用户决策，2026-10-28）；
+#                             # 经 paramiko 连接（免 ssh client/sshpass），参数名保留 --ssh-*
 #   webui_control.sh stop     [--port N] [--code-path P]
 #
 # 子命令语义:
 #   status    只读报告：端口占用者身份 / 代码完备性 / 依赖四件套 /（末行 JSON）
 #   start     守卫（空闲或已是本 webui 则幂等成功）→ 代码校验 → 依赖校验（缺则 rc=6
-#             给安装命令，由 Agent 尝试一次、失败交用户）→ daemonize 拉起 → 探活 200
+#             给安装命令，由用户安装后重跑复验——Agent 不代装，铁律 9）→ daemonize 拉起 → 探活 200
 #   register  先探 <url>/anomaly/metrics 可达性（不可达默认拒绝，--force 逃生）→
 #             委托 register_instance.sh 写配置（热重载即生效）
-#   tunnel    建-daemonize-探活 一体的本地端口转发（凭据只经 --pass-file 路径引用，
-#             本体绝不入命令行/日志——铁律 10）；幂等：隧道已通则跳过
+#   tunnel    建-daemonize-探活 一体的本地端口转发（paramiko 实现，免 ssh client/sshpass；
+#             凭据只经 --pass-file 路径引用，本体不入命令行/日志）；幂等：隧道已通则跳过
 #   stop      按 pidfile/进程特征精准 TERM→宽限→同批 KILL
 #
 # 退出码: 0=成功/已就绪  1=启动失败或未就绪  2=用法错误  5=代码/配置不完备
@@ -156,14 +157,14 @@ if [ "$ACTION" = "start" ]; then
   # 代码校验
   [ -f "$CODE/webui/main.py" ] || { echo "错误：$CODE 下无 webui/main.py（控制节点无代码时，先由 Agent 经 ansible 从被测节点拷回最小集 webui/ + configs/）" >&2; printf '{"rc":5,"msg":"webui code missing"}\n'; exit 5; }
   [ -f "$CODE/configs/webui.yaml" ] || { echo "错误：$CODE 下无 configs/webui.yaml（webui 启动依赖；可从被测节点仓库 configs/ 一并拷回）" >&2; printf '{"rc":5,"msg":"webui.yaml missing"}\n'; exit 5; }
-  # 依赖校验（缺则交 Agent 尝试一次安装；脚本不代装）
+  # 依赖校验（缺则给出安装命令，由用户安装后重跑复验；脚本不代装——铁律 9）
   resolve_py
   [ -n "$PYBIN" ] || { echo "错误：未找到 python3/python" >&2; printf '{"rc":6,"msg":"python not found"}\n'; exit 6; }
   MISS=$(deps_missing)
   if [ -n "$MISS" ]; then
     PIP=$(command -v pip3 || command -v pip || echo "pip")
     echo "错误：webui 依赖缺失: $(printf '%s' "$MISS" | tr '\n' ' ')" >&2
-    echo "安装命令（Agent 尝试一次，失败交用户）：$PYBIN -m pip install $(printf '%s' "$MISS" | tr '\n' ' ')" >&2
+    echo "安装命令（由用户执行，Agent 不代装；装好后重跑本命令复验）：$PYBIN -m pip install $(printf '%s' "$MISS" | tr '\n' ' ')" >&2
     printf '{"rc":6,"msg":"deps missing","missing":"%s"}\n' "$(json_escape "$(printf '%s' "$MISS" | tr '\n' ' ')")"
     exit 6
   fi
@@ -244,14 +245,15 @@ if [ "$ACTION" = "tunnel" ]; then
   done
   LOGF="/tmp/webui_tunnel_${LPORT}.log"; PIDF="/tmp/webui_tunnel_${LPORT}.pid"
 
-  # --stop：精准拆除本条隧道（pidfile 真身 + 进程表按转发特征兜底，含 sshpass/ssh 一对），
+  # --stop：精准拆除本条隧道（pidfile 真身 + 进程表按转发特征兜底，paramiko 转发进程），
   # 防包装层泄漏；不要求 --ssh-host
   if [ "${STOPFLAG:-}" = "yes" ]; then
     [ -n "$LPORT" ] || [ -n "$TPORT" ] || usage_exit "tunnel --stop 需要 --local-port 或 --target-port"
     [ -n "$LPORT" ] || LPORT="1${TPORT}"
     _killed=""
     [ -f "$PIDF" ] && { _p=$(cat "$PIDF" 2>/dev/null); [ -n "$_p" ] && kill "$_p" 2>/dev/null && _killed="$_p"; }
-    # 转发特征匹配：-L 后是空格（"−L 18010:127.0.0.1:8010"）；首字符括号化防 grep 自匹配
+    # 转发特征匹配：paramiko_forward.py 的 --forward 参数含 "<LPORT>:127.0.0.1:<TPORT>"；
+    # 首字符括号化防 grep 自匹配
     _pat="${LPORT}:127.0.0.1:${TPORT}"
     _scan_pat="[${_pat%"${_pat#?}"}]${_pat#?}"
     for _p in $(ps -eo pid,args 2>/dev/null | grep -- "$_scan_pat" | grep -v grep | awk '{print $1}'); do
@@ -276,18 +278,24 @@ if [ "$ACTION" = "tunnel" ]; then
     printf '{"rc":0,"msg":"tunnel-alive","local_port":"%s"}\n' "$(json_escape "$LPORT")"
     exit 0
   fi
-  # 凭据（本体不落命令行：密码经 -f 文件引用）
+  # 凭据（本体不落命令行：密码经 --pass-file 文件引用，paramiko 转发器自行读取）
   if [ -n "$PASSF" ]; then
     [ -f "$PASSF" ] || { echo "错误：密码文件不存在: $PASSF（路径引用，本体不入对话）" >&2; printf '{"rc":2,"msg":"pass file missing"}\n'; exit 2; }
-    command -v sshpass >/dev/null 2>&1 || { echo "错误：sshpass 未安装（Agent 可自装：apt/yum install sshpass 或 pipx 环境）" >&2; printf '{"rc":6,"msg":"sshpass missing"}\n'; exit 6; }
   fi
-  # daemonize：不经 sh -c 包装——$! 即 sshpass/ssh 真身，stop 时 kill 一次到位
-  # 本地端按 --local-bind 绑定（默认 0.0.0.0，用户决策）；ExitOnForwardFailure 防假活
-  if [ -n "$PASSF" ]; then
-    setsid sshpass -f "$PASSF" ssh -N -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -p "$SPORT" "$SUSER@$SHOST" -L "$LBIND:$LPORT:127.0.0.1:$TPORT" >>"$LOGF" 2>&1 </dev/null &
-  else
-    setsid ssh -i "$KEYF" -N -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -p "$SPORT" "$SUSER@$SHOST" -L "$LBIND:$LPORT:127.0.0.1:$TPORT" >>"$LOGF" 2>&1 </dev/null &
-  fi
+  # paramiko 可用性（传输一律 paramiko——铁律 9；缺失交用户安装，Agent 不代装）
+  resolve_py
+  [ -n "$PYBIN" ] || { echo "错误：未找到 python3/python" >&2; printf '{"rc":6,"msg":"python not found"}\n'; exit 6; }
+  "$PYBIN" -c "import paramiko" >/dev/null 2>&1 || { echo "错误：paramiko 未安装（由用户安装后重跑：$PYBIN -m pip install paramiko）" >&2; printf '{"rc":6,"msg":"paramiko missing"}\n'; exit 6; }
+  SD=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+  FWD="$SD/paramiko_forward.py"
+  [ -f "$FWD" ] || { echo "错误：缺少 $FWD（paramiko 端口转发器，须与本脚本同目录）" >&2; printf '{"rc":2,"msg":"paramiko_forward.py missing"}\n'; exit 2; }
+  # daemonize：paramiko 转发进程——不经 sh -c 包装，$! 即真身，stop 时 kill 一次到位；
+  # 本地端按 --local-bind 绑定（默认 0.0.0.0，用户决策）；keepalive 由转发器内置；
+  # argv 含转发特征 "<LPORT>:127.0.0.1:<TPORT>"（--forward 参数），--stop 按该特征兜底扫描
+  setsid "$PYBIN" "$FWD" --host "$SHOST" --port "$SPORT" --user "$SUSER" \
+      --local-bind "$LBIND" --local-port "$LPORT" --target-port "$TPORT" \
+      ${PASSF:+--pass-file "$PASSF"} ${KEYF:+--key-path "$KEYF"} \
+      --forward "$LBIND:$LPORT:127.0.0.1:$TPORT" >>"$LOGF" 2>&1 </dev/null &
   echo $! >"$PIDF"
   echo "[tunnel] 已下发 ${LBIND}:${LPORT} → ${SHOST}:127.0.0.1:${TPORT} pid=$(cat "$PIDF") log=$LOGF"
   sleep 3

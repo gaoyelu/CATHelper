@@ -9,13 +9,13 @@
 环境、tokenizer、pkl 现成，pkl 零传输；工具代码查缺顺序：节点侧检出根 `repo_checkout` →
 控制节点副本补投缺失文件 → 双侧皆缺请用户检出仓库），产出 `<报告>.html + <报告>.stats.json` 回传控制节点，
 由 `tools/merge_reports.py` 合并为一份总报告（见下节）。pkl 集中同步到控制节点本机生成
-为遗留备选路径，仅单机自查/离线深挖时使用。
+为遗留备选路径，仅单机自查/离线深挖、或孤儿 pkl 降级通道（档案对不上，见下文「孤儿 pkl」节）时使用。
 
 ## 分布式生成与合并（多实例舰队标准流程）
 
 ```
 控制节点（唯一调度者）：
- 1. 全局档案（instances.yaml）→ 解析目标实例 → 按节点分组
+ 1. 跨会话档案（instances.yaml，固定落点，查无即无档案）→ 解析目标实例 → 按节点分组
  2. 相对时间在控制节点换算为绝对窗口 --from/--to 下发（免疫节点时钟偏差）
  3. 执行环境定点验证（执行位 = 档案 runtime，不限容器）：docker → 容器内验证；venv/conda →
     该解释器验证；bare → 宿主机；档案缺 runtime 记录先补档。验证三项：
@@ -54,10 +54,10 @@ python tools/merge_reports.py --output <合并报告.html> \
    分布表，明细无法解码）。依赖在**运行环境内**验证（执行位跟随档案 runtime）：容器/venv 自带
    依赖时在运行环境内执行报告（容器内产出经 docker cp 出宿主机再 fetch 回）——不在被测节点
    宿主机 pip 装依赖；
-2. `configs/instances.yaml`（全局服务档案，见下节）已配置实例；
+2. `configs/instances.yaml`（跨会话服务档案，见下节）已配置实例；
 3. 各实例 pkl 位于配置 `pkl_dir` 指向的**本地**目录（本工具不做远程拉取）。标准流程 = 节点侧生成：
    pkl_dir 即 pkl 所在节点上的原地目录（每节点渲染最小 instances.yaml，pkl 零传输）；仅遗留备选
-   路径（控制节点本机生成/离线深挖）才需先同步 pkl（ansible fetch / rsync；持续追加中的大 pkl
+   路径（控制节点本机生成/离线深挖/孤儿 pkl 降级）才需先同步 pkl（ansible fetch / rsync；持续追加中的大 pkl
    建议先压缩再传输，同步慢且易不一致）。**容器部署链路**：pkl 在容器层（`VLLM_ANOMALY_SAVE_PATH`
    为容器内路径）→ 先 `docker cp <容器>:<save_path> <宿主机临时目录>` 拷出到宿主机 → 就地作为
    该节点 pkl_dir（宿主机挂载目录内的 pkl 宿主机直达，无需 docker cp；执行位同理——runtime
@@ -98,9 +98,11 @@ python tools/anomaly_report.py
 - exit code：0 成功；1 运行错误（配置缺失/pkl_dir 不存在）；2 参数互斥/非法；3 全部实例失败；
 - stdout 输出摘要（各实例分类型数量/失败实例原因），最后一行 `报告已生成: <html绝对路径>`。
 
-## 全局服务档案（configs/instances.yaml）
+## 跨会话服务档案（configs/instances.yaml）
 
 报告数据源 + 部署事实缓存（Agent 维护：读档优先、缺则询问+回写、探后回写；
+落点仅 SKILL.md「路径约定」两处（`<仓库根>/configs/` 或 `<SKILL_DIR>/.archive/`），
+查无即无档案，禁止全盘搜索补找（SKILL.md 铁律 11）；
 `*` 标注字段为部署档案可选字段，报告工具容忍未知字段）：
 
 ```yaml
@@ -130,10 +132,11 @@ instances:
     hardware: NPU                  # * NPU | GPU | "-"（附属获取物，probe 顺带判定）
     integrated_at: "2026-10-20"    # * 接入日期
     last_probed: "2026-10-20 15:00"      # * 最后一次 probe 时间（新鲜度提示，过期重探）
-    # ---- 连接引用字段（铁律 10 允许的"引用"；凭证本体绝不入档案）----
-    ssh_user: root                       # * ansible 连接用户
-    connection_password_file: ~/.ansible_cpass   # * 密码文件路径（引用）
-    key_path: ~/.ssh/id_ed25519          # * SSH 私钥路径（引用）
+    # ---- 连接凭证字段（铁律 10：获取后必须显式记录，下次会话直接复用、不再重问）----
+    ssh_user: root                       # * ansible 连接用户（必记）
+    ssh_password: "xxxxxx"               # * 明文密码（用户直接给出时必记；与密码文件可并存）
+    connection_password_file: ~/.ansible_cpass   # * 密码文件路径（运行时载体；选项 b 用户自建或 Agent 物化）
+    key_path: ~/.ssh/id_ed25519          # * SSH 私钥路径（密钥模式）
     stopped:                             # * 停服标记（结构化；停服后条目保留，重新拉起后删除本字段）
       result: "停服成功（定向停服，无残留）"  #   * 停服结果摘要
       at: "2026-10-29 08:15"             #   * ISO 时间
@@ -141,14 +144,43 @@ instances:
 ```
 
 **档案使用守则**：静态身份信息（模型路径/tokenizer/启动脚本/pkl 文件名/部署方式/runtime/
-repo_checkout）可信复用；
+repo_checkout/**连接凭证**（ssh_user/ssh_password/connection_password_file/key_path——铁律 10
+显式入档，命中直接复用不重问，仅认证失败时复核））可信复用；
 动态状态（进程存活/端口/空闲卡/monitor_rate 当前值）执行前**必须实测**（铁律 2）——
-档案只免"问用户"，不免"实测"。**停服双轨**：本档案条目默认保留 + 结构化 stopped 标记
+档案只免"问用户"，不免"实测"。档案为明文敏感文件（含密码字段），建议 `chmod 600`。
+**停服双轨**：本档案条目默认保留 + 结构化 stopped 标记
 （webui.yaml 登记项默认注销，见 webui-guide.md）。**拉起请求先查档案**：用户给出被测 IP
 即按 host 过滤该机实例，running/stopped 分列展示（running 状态顺手 HTTP 复核标注），有
-历史实例先让用户选复用/重拉，复用确认后仍 probe 实测再拉起——档案命中可把"问参数"坍缩
-成一次复用确认。**落点**：仓库可用 → `<仓库根>/configs/instances.yaml`；
+历史实例：**单命中自动复用**（复用仍 probe 实测再拉起，不问用户），多命中/参数冲突才让用户选
+——档案命中把"问参数"坍缩为零交互或一次复用。**落点**：仓库可用 → `<仓库根>/configs/instances.yaml`；
 repo-less（仓库解析失败）→ `<SKILL_DIR>/.archive/instances.yaml`。
+
+## 孤儿 pkl（档案对不上）的报告路径
+
+适用：需要为某个 pkl 出报告，但 instances.yaml 查无对应实例（按 文件名/路径/目录 过滤无命中）。
+
+**纪律：对不上 → 立刻停止探寻**——不读 pkl 猜身份、不漫游找 tokenizer/模型、不全盘搜索
+（铁律 11）；第一步就是把降级后果讲明白，让用户二选一。
+
+**先告知（必做）**：不知道该 pkl 的执行环境与模型路径 ⇒ tokenizer 无法正确加载 ⇒
+**明细/异常用例解码失败，报告只剩类型分布/趋势/计数，异常用例展示不完备**。
+
+- **用户接受降级**：
+  1. **优先使用档案里已有的执行环境**——借用其他已登记实例的 runtime（容器 exec /
+     venv·conda 解释器；仅需 numpy/PyYAML，pkl 对该环境只读可见即可执行；tokenizer 同样降级）；
+     借用环境定点验证不过（pkl 不可见/缺依赖）→ 落到下一条，不擅自换第三个环境；
+  2. 档案里也没有可用执行环境记录 → **优先使用控制节点生成**（孤儿 pkl 豁免通道）：
+     pkl fetch 回控制节点本机执行 anomaly_report.py（需 numpy/PyYAML，缺失按铁律 9 给命令
+     由用户装），**tokenizer 降级**——分布表正常、明细无解码，报告显著标注；
+  3. 实例命名 `orphan-<pkl文件名>`，标注"来源未匹配 + 降级范围"，产出照常 fetch/merge；
+- **用户不接受 → 用户提供最少要素**（pkl 路径已知）：**执行环境**（docker:<容器名> /
+  venv:<解释器路径> / conda:<env名> / bare）+ **模型路径**（tokenizer 加载源）；
+  **先验证后生成**——W4.3 三项定点验证在该执行环境内做（pkl/tokenizer 可见性、
+  numpy/PyYAML/transformers、检出根工具代码），验证不过把缺失项原样反馈，不擅自换环境；
+  通过 → 渲染最小 instances.yaml → 执行环境内生成 → fetch 回 → merge；
+- **收尾必做：信息回写档案**——新登记实例条目（pkl_file/server/model/tokenizer_path/runtime/
+  覆盖窗口 + note：来源未匹配、用户已确认，执行环境/模型来源注明"用户提供"或"降级借用"），
+  下次出报告免重查；全程对 pkl 零写操作（不改名/不删/不移动）。
 
 ## 处理流水线
 
@@ -176,7 +208,8 @@ repo-less（仓库解析失败）→ `<SKILL_DIR>/.archive/instances.yaml`。
    - 异常类型分布表：异常类型 | 数量 | pkl 文件数据位置序号（可回查）；NaN 仅计数不成节
    - 类型变化（窗口首日 vs 末日）：新出现/消失的异常类型 note 行（有变化才展示）
     - 检出趋势：自适应粒度（窗口 ≤2 天按小时分桶、x 轴铺满整个固定窗口、空档计 0；
-      更长窗口按天）——仅 HTML 内联 SVG 折线图，x 轴标注自动稀疏化，悬停看精确时段与
+      更长窗口按天）——仅 HTML 内联 SVG 折线图，x 轴标注按标签宽度自适应稀疏化
+      （相邻日期标签不重叠，末标签 end 锚点防出界），悬停看精确时段与
       数值；粒度记入 stats.json（trend.granularity）；Markdown 无图不铺数值，直接省略本节
    - 异常实例具体分析（每类型 ≤max-detail 条）：HTML 中每条为 <details> 折叠块（可下拉查看），
      Markdown 平铺；每条含：

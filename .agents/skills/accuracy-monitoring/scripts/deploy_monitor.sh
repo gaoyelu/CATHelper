@@ -1,7 +1,7 @@
 #!/bin/sh
 # deploy_monitor.sh —— 变更执行：预建落盘目录 + 写 env + 后台拉起 vllm serve --middleware
 #
-# ⚠️ 仅在用户确认部署/重启方案后投递执行（本脚本会拉起/重启服务）
+# ⚠️ 拉起条件满足后直接投递执行，不设用户确认（本脚本会拉起/重启服务，铁律 6）
 # ⚠️ daemonize 后立即返回"已下发"——模型加载耗时 1~10 分钟，健康等待由 verify_anomaly.sh 轮询
 #
 # 用法:
@@ -18,7 +18,7 @@
 #                      （JSON 含 requested_port/port 两字段；launch-script 模式
 #                      改写脚本内 --port 为顺位端口后以脚本副本拉起）
 #     --dry-run        只做预检（import/幂等/端口/卡况）+ 组装命令并打印，不做任何变更、不拉起
-#                      ——变更清单确认环节与测试解析用
+#                      ——拉起前预检与测试解析用
 #     --launch-script  现有启动脚本路径：先设置好 env 再以 sh 执行该脚本（env 对脚本内命令生效）。
 #                      ⚠️ 脚本内必须自带 --middleware anomaly_middleware.AnomalyMiddleware
 #                      （本模式只注入 env，不改写脚本 CLI 参数）——缺失时默认拒绝（rc=3），

@@ -78,8 +78,9 @@ docker 部署建议将 env 通过 `-e` 注入容器、检测组件安装进镜�
 - **必须绝对路径**；文件夹模式目录须预先存在、文件模式父目录须预先存在（投递脚本会 `mkdir -p`
   预创建），否则启动 fail-fast 报「保存的路径不存在」；
 - 目标 pkl 已存在（文件模式）或目录内已有既有 *.pkl（文件夹模式）→ probe 输出
-  `save_path_file_exists`/`dir_pkls`（**只报告不动作**）；处置（沿用追加/改名/删除/换路径）
-  必须由用户决策，Agent 不得默认删除或静默沿用（见 SKILL.md W1 pkl 落盘决策点）；
+  `save_path_file_exists`/`dir_pkls`（**只报告不动作**）；处置自动定（SKILL.md W1.5）：
+  用户显式给了新路径/改名 → 用新的（旧文件原地保留），否则**沿用旧 pkl 追加**（编号续接
+  不覆盖，报告按时间窗区分）；**删除仅限用户明确指示**（执行前复述大小/mtime，不可逆）；
 - 不设置 → 不落盘：无异常现场 → 明细报告无法生成、无法回查编号；
 - 记录字段与编号规则见 pkl-data-contract.md。
 
@@ -100,7 +101,8 @@ curl -X POST http://<host>:<port>/anomaly/config \
 ```
 
 - 不持久化：重启回退 env 初始值；
-- 调整前须用户确认；调整后回读 gauge `vllm_anomaly_monitor_rate` 作为证据。
+- 调整不设确认环节：用户明确指令（如"调到 0.3"）即为确认，直接执行；仅 Agent 主动建议调整时
+  才征询；调整后回读 gauge `vllm_anomaly_monitor_rate` 作为证据。
 
 ## 启动期 fail-fast（硬依赖失败 → 终止启动，不降级运行）
 

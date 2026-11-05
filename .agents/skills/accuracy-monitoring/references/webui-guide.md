@@ -6,7 +6,7 @@
 ## 安装与启动（控制节点，webui_control.sh 管理）
 
 ```bash
-pip install fastapi uvicorn httpx prometheus_client   # 依赖四件套（缺时 Agent 尝试一次）
+pip install fastapi uvicorn httpx prometheus_client   # 依赖四件套（缺时 Agent 给命令，用户安装后复验——铁律 9 零代装）
 sh <SKILL_DIR>/scripts/webui_control.sh start --code-path <仓库根>   # 首选 9092，被无关进程占用自动顺位 +1，bind 0.0.0.0
 ```
 
@@ -85,12 +85,13 @@ start（守卫 + 端口顺位探测：请求端口被无关进程占用 → 顺�
      ├─ 代码取优先级：档案/用户给定路径 → 控制节点无代码则从被测节点拷回最小集（见下）
      ├─ 代码校验（webui/main.py + configs/webui.yaml）不过 → rc=5
      └─ 依赖校验（fastapi/uvicorn/httpx/prometheus_client）缺 → rc=6 附安装命令
-        → Agent pip 安装一次（失败即停交用户，不换源不重试——铁律 9）
+        → **用户安装**，装好后重跑 start 复验（Agent 不代装——铁律 9）
 ```
 
 **实例可达性（关键）**：webui 靠 HTTP 轮询实例；推理服务端口常被安全组挡住（控制节点
 探不通）——**先建隧道再注册**，注册不可达 URL 只会得到永久离线卡片（register 默认拒绝，
-`--force` 逃生）：
+`--force` 逃生）。隧道由 **paramiko 实现**（免 ssh client/sshpass——铁律 9；控制节点需已装
+paramiko，缺失时 rc=6 给命令由用户安装）：
 
 ```bash
 sh <SKILL_DIR>/scripts/webui_control.sh tunnel --ssh-host <被测节点IP> --ssh-port 2123 \
@@ -98,7 +99,7 @@ sh <SKILL_DIR>/scripts/webui_control.sh tunnel --ssh-host <被测节点IP> --ssh
                                                           # 本地端默认绑 0.0.0.0（用户决策），--local-bind 可改
 sh <SKILL_DIR>/scripts/webui_control.sh register --config <webui.yaml> \
    --name <实例名> --url http://127.0.0.1:18010          # 轮询 URL 是拨号目标，用 127.0.0.1（同机隧道入口）
-# 拆除/重建：tunnel ... --stop（精准杀 sshpass/ssh 一对，防包装层泄漏）后重跑 tunnel
+# 拆除/重建：tunnel ... --stop（精准杀 paramiko 转发进程，防包装层泄漏）后重跑 tunnel
 ```
 
 **控制节点无代码 → 从被测节点拷回最小集**（一次性，秒级；只拷 webui/ + configs/ + tools/ +
@@ -118,8 +119,9 @@ mkdir -p ~/accuracy-monitor-control && tar xzf /tmp/opencode/webui_min.tgz -C ~/
 **访问**：用户与控制节点同机 → `http://localhost:9092`；远程 →
 `ssh -L 9092:localhost:9092 <控制节点>` 后开 `http://localhost:9092`。
 首次拉起若 configs/webui.yaml 仍为默认口令 `admin@123`，**必须提醒用户改密**（弱口令 +
-0.0.0.0 = 任何可达者可试登录）。被测节点若有遗留 webui（历史部署），在 9092 就绪后
-**建议用户关闭**（需确认），趋势数据无法迁移、自 9092 启动起累积。
+0.0.0.0 = 任何可达者可试登录）。被测节点若有遗留 webui（历史部署）：默认保留不动、
+仅在汇报中告知（趋势数据无法迁移、自 9092 启动起累积，双看板影响说明白；是否清理由用户
+后续指示，不设确认环节）。
 
 ## 实例登记（register_instance.sh）
 
