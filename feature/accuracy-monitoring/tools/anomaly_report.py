@@ -548,13 +548,22 @@ def svg_trend(days, counts, title, fmt="%m-%d", hover="%Y-%m-%d"):
     if n == 1:
         idxs = [0]
     else:
-        stepx = max(1, (n - 1) // 6)
+        # x 轴标注防重叠：按标签实际宽度自适应步长（font-size 10 → 每字符约 6px + 边距），
+        # 末点必须标注；与前一个标注过近时丢弃前一个常规标注（末标签 end 锚点，需 1.5 倍宽间距），
+        # 杜绝相邻日期标签重叠（如"11-01"与"11-02"尾部挤在一起）
+        lw = len(days[-1].strftime(fmt)) * 6 + 8
+        slot = pw / (n - 1)
+        stepx = max(1, (n - 1) // 6, math.ceil(lw / slot))
         idxs = list(range(0, n, stepx))
         if idxs[-1] != n - 1:
+            while len(idxs) > 1 and (n - 1 - idxs[-1]) * slot < 1.5 * lw:
+                idxs.pop()
             idxs.append(n - 1)
-    for i in idxs:
+    for j, i in enumerate(idxs):
+        anchor = "end" if (j == len(idxs) - 1 and len(idxs) > 1) else "middle"
         parts.append('<text x="%.1f" y="%d" font-size="10" fill="#8a94a0" '
-                     'text-anchor="middle">%s</text>' % (X(i), H - 10, days[i].strftime(fmt)))
+                     'text-anchor="%s">%s</text>'
+                     % (X(i), H - 10, anchor, days[i].strftime(fmt)))
     pts = " ".join("%.1f,%.1f" % (X(i), Y(v)) for i, v in enumerate(counts))
     parts.append('<polyline points="%s" fill="none" stroke="#1a5fb4" stroke-width="2"/>' % pts)
     for i, v in enumerate(counts):
