@@ -117,7 +117,7 @@ def main():
                                 description="合并多节点异常分析报告为一份总报告")
     p.add_argument("reports", nargs="+", help="各节点回传的 <报告>.html（同目录需有同基名 .stats.json）")
     p.add_argument("--output", required=True, help="合并报告输出路径（.html）")
-    p.add_argument("--title", default="推理精度异常数据分析报告（合并）")
+    p.add_argument("--title", default="推理精度异常数据分析报告")
     p.add_argument("--error", action="append", default=[], dest="extra_errors",
                    metavar="实例名=原因", help="整节点失败声明（无报告可回传时），可多次")
     args = p.parse_args()
