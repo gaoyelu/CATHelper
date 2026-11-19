@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import random
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -24,6 +25,7 @@ from .extractor import (
     extract_chat_text_tokenids,
     extract_completions_response,
     extract_completions_text_tokenids,
+    extract_reasoning_field,
     inject_params,
     save_original_params,
     strip_chat_response,
@@ -35,6 +37,28 @@ from .metrics import METRICS_CONTENT_TYPE, Metrics
 logger = get_logger()
 
 TARGET_PATHS = ("/v1/chat/completions", "/v1/completions")
+
+# 异常记录列表端点单次返回上限（分页用 since_id 增量拉取）
+ANOMALIES_LIST_LIMIT_MAX = 1000
+
+
+def _int_qs(qs: Dict[str, List[str]], key: str, default: int, lo: int, hi: int) -> int:
+    """解析 query 参数为 int 并夹取 [lo, hi]；缺失/非法返回 default。"""
+    vals = qs.get(key)
+    if not vals:
+        return default
+    try:
+        v = int(vals[0])
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _parse_query_string(scope: dict) -> Dict[str, List[str]]:
+    raw = scope.get("query_string", b"")
+    if isinstance(raw, bytes):
+        raw = raw.decode("latin-1")
+    return urllib.parse.parse_qs(raw or "")
 
 
 @dataclass
@@ -240,7 +264,7 @@ class ResponseInterceptor:
             )
             self._choice_text_tokenids = extract_chat_text_tokenids(data)
             self._choice_reasoning_contents = [
-                (c.get("message") or {}).get("reasoning_content")
+                extract_reasoning_field(c.get("message"))
                 if isinstance(c, dict) else None
                 for c in ch
             ]
@@ -324,6 +348,7 @@ class ResponseInterceptor:
                 texts=self.get_choice_texts(),
                 text_tokenids=self.get_choice_text_tokenids(),
                 reasoning_contents=self.get_choice_reasoning_contents(),
+                resolver=self._resolver,
             )
         except RuntimeError as exc:
             # 无运行事件循环等：记录后跳过（不影响客户端）
@@ -419,6 +444,13 @@ class AnomalyMiddleware:
         if method == "GET" and path == self.config.metrics_path:
             await self._serve_metrics(send)
             return
+        # 异常记录端点（内联，仅 GET）：列表 / 详情
+        if method == "GET" and path == self.config.anomalies_path:
+            await self._serve_anomalies_list(scope, send)
+            return
+        if method == "GET" and path.startswith(self.config.anomalies_path + "/"):
+            await self._serve_anomaly_detail(scope, send, path[len(self.config.anomalies_path) + 1:])
+            return
         # 配置端点（内联，GET 查询 / POST 更新）
         if path == self.config.config_path:
             if method == "POST":
@@ -498,6 +530,69 @@ class AnomalyMiddleware:
         await send(
             {"type": "http.response.body", "body": body, "more_body": False}
         )
+
+    async def _serve_anomalies_list(self, scope: dict, send) -> None:
+        """GET {anomalies_path}?since_id=N&limit=M：异常元数据增量列表（id 升序）。
+
+        未开启异常保存（无 AnomalyStore）→ enabled=false 空列表（端点仍可达）。
+        """
+        if self._anomaly_store is None:
+            await self._send_json(
+                send, 200, {"enabled": False, "latest_id": 0, "total": 0, "records": []}
+            )
+            return
+        qs = _parse_query_string(scope)
+        since_id = _int_qs(qs, "since_id", 0, 0, 2 ** 62)
+        limit = _int_qs(qs, "limit", 200, 1, ANOMALIES_LIST_LIMIT_MAX)
+        await self._anomaly_store.ensure_loaded()
+        records, total = self._anomaly_store.list_meta_sync(since_id, limit)
+        await self._send_json(send, 200, {
+            "enabled": True,
+            "latest_id": int(self._anomaly_store.counter),
+            "total": total,
+            "records": records,
+        })
+
+    async def _serve_anomaly_detail(self, scope: dict, send, suffix: str) -> None:
+        """GET {anomalies_path}/{id}?include=tokens,logprobs：单条异常完整记录。
+
+        默认返回展示所需轻量字段（prompt/text/reasoning_content 等）；
+        include=tokens 追加 text_tokenid，include=logprobs 追加 topk_logprobs/tokens_ids
+        （大字段，按需拉取）。
+        """
+        try:
+            aid = int(suffix)
+        except (TypeError, ValueError):
+            await self._send_json(send, 400, {"error": "异常编号必须为整数"})
+            return
+        if self._anomaly_store is None:
+            await self._send_json(send, 404, {"error": "异常保存未开启（未配置保存路径）"})
+            return
+        await self._anomaly_store.ensure_loaded()
+        rec = self._anomaly_store.get_record_sync(aid)
+        if rec is None:
+            await self._send_json(send, 404, {"error": f"异常 {aid} 不存在"})
+            return
+        qs = _parse_query_string(scope)
+        include = set((qs.get("include", [""])[0] or "").split(",")) - {""}
+        loc = rec.get("localization")
+        out: Dict[str, Any] = {
+            "id": aid,
+            "time": rec.get("time"),
+            "ill_type": rec.get("ill_type"),
+            "model_name": rec.get("model_name"),
+            "prompt": rec.get("prompt"),
+            "text": rec.get("text"),
+            "reasoning_content": rec.get("reasoning_content"),
+            # 检出位置定位数据（旧版记录无此字段 → None，前端降级展示）
+            "localization": loc if isinstance(loc, dict) else None,
+        }
+        if "tokens" in include:
+            out["text_tokenid"] = rec.get("text_tokenid")
+        if "logprobs" in include:
+            out["topk_logprobs"] = rec.get("topk_logprobs")
+            out["tokens_ids"] = rec.get("tokens_ids")
+        await self._send_json(send, 200, out)
 
     async def _send_json(self, send, status: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")

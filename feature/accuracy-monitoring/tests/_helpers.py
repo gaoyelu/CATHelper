@@ -56,14 +56,18 @@ def build_chat_response(
     entries: List[Dict[str, Any]],
     n: int = 1,
     reasoning_content: Optional[str] = None,
+    reasoning: Optional[str] = None,
 ) -> Dict[str, Any]:
     """构造 chat 非流式响应（n 个 choice，每个相同 entries）。
 
-    reasoning_content：若提供，加入 message.reasoning_content（thinking model）。
+    reasoning_content：若提供，加入 message.reasoning_content（旧版 vLLM thinking model）。
+    reasoning：若提供，加入 message.reasoning（新版 vLLM thinking model）。
     """
     msg: Dict[str, Any] = {"role": "assistant", "content": "x"}
     if reasoning_content is not None:
         msg["reasoning_content"] = reasoning_content
+    if reasoning is not None:
+        msg["reasoning"] = reasoning
     return {
         "id": "chatcmpl-test",
         "object": "chat.completion",

@@ -26,6 +26,10 @@ DETECTED_METRIC = "vllm_anomaly_detected_total"
 ERRORS_METRIC = "vllm_anomaly_detection_errors_total"
 DURATION_METRIC = "vllm_anomaly_detection_duration_seconds"
 
+ANOMALIES_PATH = "/anomaly/anomalies"
+# 单次增量拉取的异常元数据条数上限（首轮补齐最多拉这么多，其余靠后续轮询）
+ANOMALIES_PULL_LIMIT = 500
+
 # gauge 指标名 → 异常类型名
 GAUGE_NAMES = {
     "vllm_anomaly_last_rare_character": "rare_character",
@@ -188,6 +192,7 @@ class Collector:
         self._client = None
         self._tasks: Dict[str, asyncio.Task] = {}
         self._instances: Dict[str, Any] = {}  # name -> InstanceConfig
+        self._anomaly_since: Dict[str, int] = {}  # name -> 已拉取的最新异常编号
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -290,6 +295,8 @@ class Collector:
         self._store.observe_models(inst.name, snapshot.models)
 
         delta = self._synth.process(snapshot)
+        # 异常元数据增量拉取（基线轮也执行；失败只影响 feed 状态，不影响指标链路）
+        await self._poll_anomalies(inst)
         if delta is None:
             return None
         self._store.record_delta(inst.name, delta)
@@ -297,6 +304,137 @@ class Collector:
         for e in delta.events:
             self._alerts.ingest(e)
         return delta
+
+    # ------------------------------------------------------------------ #
+    # 异常记录增量拉取（/anomaly/anomalies）
+    # ------------------------------------------------------------------ #
+    async def _poll_anomalies(self, inst) -> None:
+        """按 since_id 增量拉取实例异常元数据并入环形缓冲。
+
+        feed 状态机：ok / disabled（实例未开启保存）/ unavailable（端点缺失、
+        非 200、解析失败、网络异常）。任何失败不影响实例 online 状态。
+        """
+        name = inst.name
+        url = inst.url.rstrip("/") + ANOMALIES_PATH
+        since = self._anomaly_since.get(name, 0)
+        url += f"?since_id={since}&limit={ANOMALIES_PULL_LIMIT}"
+        try:
+            resp = await self._client.get(url)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._store.set_anomaly_feed(name, "unavailable")
+            return
+        if resp.status_code == 404:
+            self._store.set_anomaly_feed(name, "unavailable")  # 旧版中间件无此端点
+            return
+        if resp.status_code != 200:
+            self._store.set_anomaly_feed(name, "unavailable")
+            return
+        try:
+            data = resp.json()
+        except Exception:
+            self._store.set_anomaly_feed(name, "unavailable")
+            return
+        if not isinstance(data, dict) or data.get("enabled") is not True:
+            self._store.set_anomaly_feed(name, "disabled")
+            return
+        records = data.get("records")
+        if not isinstance(records, list):
+            self._store.set_anomaly_feed(name, "unavailable")
+            return
+        latest = int(data.get("latest_id") or 0)
+        if latest < since:
+            # 实例侧编号回退（pkl 被清理/重建）→ 重置游标，接受重新拉取
+            since = latest
+        max_id = since
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            try:
+                meta = {
+                    "id": int(r["id"]),
+                    "ts": float(r["time"]),
+                    "ill_type": events_mod.ill_type_name(int(r["ill_type"])),
+                    "model": str(r.get("model_name") or "unknown"),
+                    "source": "live",
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            hc = r.get("hit_count")
+            if hc is not None:
+                try:
+                    meta["hit_count"] = int(hc)
+                except (TypeError, ValueError):
+                    pass
+            self._store.add_anomaly_meta(name, meta)
+            if meta["id"] > max_id:
+                max_id = meta["id"]
+        self._anomaly_since[name] = max_id
+        self._store.set_anomaly_feed(name, "ok")
+
+    async def _get_anomaly_json(self, inst, anomaly_id: int, include: str = "") -> Any:
+        """拉取单条异常记录 JSON；失败抛 PollError。include 附加查询参数。"""
+        url = inst.url.rstrip("/") + f"{ANOMALIES_PATH}/{int(anomaly_id)}"
+        if include:
+            url += f"?include={include}"
+        try:
+            resp = await self._client.get(url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise PollError(f"实例 {inst.name} 异常详情拉取失败: {exc}") from exc
+        if resp.status_code == 404:
+            raise PollError(f"异常 {anomaly_id} 不存在（实例可能已清理历史数据）")
+        if resp.status_code != 200:
+            raise PollError(f"实例 {inst.name} 返回 HTTP {resp.status_code}")
+        try:
+            rec = resp.json()
+        except Exception as exc:
+            raise PollError(f"实例 {inst.name} 异常详情解析失败: {exc}") from exc
+        if not isinstance(rec, dict):
+            raise PollError("异常详情响应不是 JSON 对象")
+        return rec
+
+    async def fetch_anomaly_detail(
+        self, inst, anomaly_id: int, with_data: bool = False
+    ) -> Dict[str, Any]:
+        """按需拉取单条异常完整记录。
+
+        常规返回轻量字段（不含 tokens/logprobs 大字段）；``with_data=True`` 且记录
+        无 localization（旧版中间件）时追加拉取 `?include=tokens,logprobs` 的重跑
+        输入大字段（topk_logprobs/tokens_ids/text_tokenid），供 webui 方案 B 离线
+        重跑定位（design_anomaly_localization.md §6.2）。
+
+        返回归一化 dict：{id, ts, ill_type(字符串名), model, prompt, text,
+        reasoning_content, localization[, topk_logprobs, tokens_ids, text_tokenid]}。
+        失败抛 PollError。
+        """
+        rec = await self._get_anomaly_json(inst, anomaly_id)
+        try:
+            ill_name = events_mod.ill_type_name(int(rec.get("ill_type")))
+        except (TypeError, ValueError):
+            ill_name = "unknown"
+        loc = rec.get("localization")
+        detail: Dict[str, Any] = {
+            "id": int(anomaly_id),
+            "ts": rec.get("time"),
+            "ill_type": ill_name,
+            "model": str(rec.get("model_name") or "unknown"),
+            "prompt": rec.get("prompt"),
+            "text": rec.get("text"),
+            "reasoning_content": rec.get("reasoning_content"),
+            # 检出位置定位数据（旧版中间件记录无此字段 → None，前端降级展示）
+            "localization": loc if isinstance(loc, dict) else None,
+        }
+        if with_data and detail["localization"] is None:
+            rec2 = await self._get_anomaly_json(
+                inst, anomaly_id, include="tokens,logprobs"
+            )
+            detail["topk_logprobs"] = rec2.get("topk_logprobs")
+            detail["tokens_ids"] = rec2.get("tokens_ids")
+            detail["text_tokenid"] = rec2.get("text_tokenid")
+        return detail
 
     def _record_trends(self, snapshot: Snapshot, delta: DeltaSummary) -> None:
         models = snapshot.models

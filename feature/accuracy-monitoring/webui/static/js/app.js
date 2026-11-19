@@ -86,6 +86,15 @@
     );
   }
 
+  function fmtFullTime(ts) {
+    if (!ts) return '-';
+    var d = new Date(ts * 1000);
+    return (
+      d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' +
+      p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds())
+    );
+  }
+
   // 自定义区间标题：同年省起始年（2026/09/10-09/20），跨年完整（2025/12/25-2026/01/05）
   function fmtRangeTitle(startStr, endStr) {
     var a = startStr.split('-');
@@ -168,6 +177,7 @@
   function setView(view) {
     $('dashboard').classList.toggle('hidden', view !== 'dashboard');
     $('instance-detail').classList.toggle('hidden', view !== 'detail');
+    $('anomaly-detail').classList.toggle('hidden', view !== 'anomaly');
     closeAlertPanel();
   }
 
@@ -187,6 +197,7 @@
     $('login-page').classList.remove('hidden');
     $('dashboard').classList.add('hidden');
     $('instance-detail').classList.add('hidden');
+    $('anomaly-detail').classList.add('hidden');
     stopPolling();
   }
 
@@ -195,6 +206,7 @@
     if (user) {
       $('current-user').textContent = user;
       $('detail-current-user').textContent = user;
+      $('anomaly-current-user').textContent = user;
     }
     setView('dashboard');
     setTimeout(resizeCharts, 0);
@@ -336,7 +348,11 @@
   // ------------------------------------------------------------------ //
   function byTypePieData(byType) {
     return ILL_TYPES.map(function (t) {
-      return { name: illLabel(t), value: (byType || {})[t] || 0 };
+      return {
+        name: illLabel(t),
+        value: (byType || {})[t] || 0,
+        itemStyle: { color: ILL_COLORS[t] },
+      };
     }).filter(function (d) {
       return d.value > 0;
     });
@@ -638,6 +654,7 @@
   function openDetail(name) {
     currentInstance = name;
     buildDetailKpis();
+    anomalyPage = 1;
     $('detail-instance-name').textContent = name;
     $('detail-instance-state').textContent = '';
     $('detail-current-user').textContent = $('current-user').textContent || '';
@@ -676,6 +693,316 @@
 
     // 自部署以来累计饼图（不随时间窗变化）
     renderPie(detailTypeChart, $('detail-type-chart'), $('detail-type-empty'), s.by_type);
+  }
+
+  // ------------------------------------------------------------------ //
+  // 异常实例列表 + 异常详情页
+  // ------------------------------------------------------------------ //
+  var currentAnomalyId = null;
+  var ANOMALY_PAGE_SIZE = 15;
+  var anomalyPage = 1;
+  var latestAnomalyData = null;
+
+  var ANOMALY_FEED_HINTS = {
+    disabled: '该实例未开启异常保存（VLLM_ANOMALY_SAVE_PATH），无法展示异常实例',
+    unavailable: '无法获取异常记录（实例离线或中间件版本过旧）',
+    unknown: '尚未获取到异常记录（等待首次轮询）',
+  };
+
+  function renderAnomalyPager(total) {
+    var pager = $('anomaly-pager');
+    var pages = Math.max(1, Math.ceil(total / ANOMALY_PAGE_SIZE));
+    if (anomalyPage > pages) anomalyPage = pages;
+    if (anomalyPage < 1) anomalyPage = 1;
+    if (total <= ANOMALY_PAGE_SIZE) {
+      pager.classList.add('hidden');
+      return;
+    }
+    pager.classList.remove('hidden');
+    $('anomaly-page-info').textContent =
+      '第 ' + anomalyPage + ' / ' + pages + ' 页 · 共 ' + total + ' 条';
+    $('anomaly-prev').disabled = anomalyPage <= 1;
+    $('anomaly-next').disabled = anomalyPage >= pages;
+  }
+
+  function renderAnomalies(data) {
+    latestAnomalyData = data;
+    var tb = $('detail-anomalies-table').querySelector('tbody');
+    var empty = $('detail-anomalies-empty');
+    var hint = $('detail-anomaly-hint');
+    var table = $('detail-anomalies-table');
+    var feed = data && data.feed ? data.feed : 'unknown';
+    var records = (data && data.records) || [];
+    tb.innerHTML = '';
+
+    // 有记录即显示表格（含导入历史）；feed 异常时在表头旁提示
+    if (records.length > 0) {
+      empty.classList.add('hidden');
+      table.classList.remove('hidden');
+      if (feed === 'ok' || feed === 'unknown') {
+        hint.classList.add('hidden');
+      } else {
+        hint.textContent = ANOMALY_FEED_HINTS[feed] || ANOMALY_FEED_HINTS.unknown;
+        hint.classList.remove('hidden');
+      }
+      renderAnomalyPager(records.length);
+      var start = (anomalyPage - 1) * ANOMALY_PAGE_SIZE;
+      records.slice(start, start + ANOMALY_PAGE_SIZE).forEach(function (r) {
+        var tr = el('tr', 'row-click');
+        tr.appendChild(el('td', '', '#' + r.id));
+        var tdType = el('td');
+        tdType.innerHTML = illTag(r.ill_type) +
+          (r.source === 'imported' ? ' <span class="tag tag-imported">导入</span>' : '');
+        tr.appendChild(tdType);
+        tr.appendChild(el('td', r.model ? '' : 'muted', r.model || '-'));
+        tr.appendChild(el('td', '', fmtTime(r.ts)));
+        // 位置数：命中 token 数 + 触发窗口数（旧版记录 / 未拉详情时为 '-'）
+        tr.appendChild(el('td', 'muted',
+          typeof r.hit_count === 'number' ? String(r.hit_count) : '-'));
+        var tdBtn = el('td');
+        var btn = el('button', 'btn btn-xs btn-primary', '详情');
+        btn.onclick = function (e) {
+          e.stopPropagation();
+          openAnomalyDetail(r.id);
+        };
+        tdBtn.appendChild(btn);
+        tr.appendChild(tdBtn);
+        tr.onclick = function () { openAnomalyDetail(r.id); };
+        tb.appendChild(tr);
+      });
+      return;
+    }
+    // 无记录：feed 异常显示原因，否则常规空态
+    $('anomaly-pager').classList.add('hidden');
+    table.classList.add('hidden');
+    hint.classList.add('hidden');
+    empty.textContent = feed === 'ok'
+      ? '暂无异常记录'
+      : (ANOMALY_FEED_HINTS[feed] || ANOMALY_FEED_HINTS.unknown);
+    empty.classList.remove('hidden');
+  }
+
+  function contentToText(content) {
+    if (content == null) return '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content.map(function (part) {
+        if (part && typeof part === 'object') {
+          if (typeof part.text === 'string') return part.text;
+          return JSON.stringify(part);
+        }
+        return String(part);
+      }).join('');
+    }
+    if (typeof content === 'object') return JSON.stringify(content, null, 2);
+    return String(content);
+  }
+
+  function promptToText(prompt) {
+    if (prompt == null) return '';
+    if (typeof prompt === 'string') return prompt;
+    if (!Array.isArray(prompt)) return JSON.stringify(prompt, null, 2);
+    var isMessages = prompt.length > 0 && prompt.every(function (m) {
+      return m && typeof m === 'object' && ('role' in m || 'content' in m);
+    });
+    if (isMessages) {
+      return prompt.map(function (m) {
+        return '[' + (m.role || 'unknown') + ']\n' + contentToText(m.content);
+      }).join('\n\n');
+    }
+    return prompt.map(function (p) { return contentToText(p); }).join('\n\n');
+  }
+
+  function fillAnomalySection(containerId, text, emptyLabel) {
+    var box = $(containerId);
+    box.innerHTML = '';
+    if (!text) {
+      box.appendChild(el('div', 'anomaly-empty', emptyLabel));
+      return;
+    }
+    var pre = el('pre', 'anomaly-pre');
+    pre.textContent = text;
+    box.appendChild(pre);
+  }
+
+  // ---------------- 检出位置高亮（design_anomaly_localization.md） ---------------- //
+  var POSITION_ILL_TYPES = { rare_character: 1, garbled: 1, repetition: 1 };
+
+  function anomalyLocal(d) {
+    return d && d.localization && typeof d.localization === 'object'
+      ? d.localization : null;
+  }
+
+  // 重叠区间合并（hit 优先级高于窗口），产出不相交高亮区间
+  function mergeSpans(spans) {
+    if (!spans || !spans.length) return [];
+    var rank = { hit: 0, repet: 1, garbled: 1, window: 1 };
+    var sorted = spans.slice().sort(function (a, b) {
+      var ka = rank[a.kind] != null ? rank[a.kind] : 2;
+      var kb = rank[b.kind] != null ? rank[b.kind] : 2;
+      return a.start - b.start || ka - kb || a.end - b.end;
+    });
+    var out = [];
+    sorted.forEach(function (s) {
+      if (!(s.end > s.start)) return;
+      var last = out[out.length - 1];
+      if (last && s.start < last.end) {
+        if (s.end > last.end) last.end = s.end;
+        var kl = rank[last.kind] != null ? rank[last.kind] : 2;
+        var ks = rank[s.kind] != null ? rank[s.kind] : 2;
+        if (ks < kl) { last.kind = s.kind; last.title = s.title; }
+      } else {
+        out.push({ start: s.start, end: s.end, kind: s.kind, title: s.title });
+      }
+    });
+    return out;
+  }
+
+  function renderTextWithSpans(container, text, spans) {
+    var pre = el('pre', 'anomaly-pre');
+    var marks = mergeSpans(spans);
+    var pos = 0;
+    marks.forEach(function (m) {
+      var s = Math.max(m.start, pos);
+      var e = Math.min(m.end, text.length);
+      if (s > pos) {
+        pre.appendChild(document.createTextNode(text.slice(pos, s)));
+      }
+      if (e > s) {
+        var mk = el('mark', 'anomaly-mark ' + (m.kind === 'hit' ? 'hit' : 'win'));
+        mk.textContent = text.slice(s, e);
+        if (m.title) mk.title = m.title;
+        pre.appendChild(mk);
+        pos = e;
+      }
+    });
+    if (pos < text.length) {
+      pre.appendChild(document.createTextNode(text.slice(pos)));
+    }
+    container.appendChild(pre);
+  }
+
+  function fillAnomalySectionSpans(containerId, text, spans, emptyLabel, unaligned) {
+    var box = $(containerId);
+    box.innerHTML = '';
+    if (!text) {
+      box.appendChild(el('div', 'anomaly-empty', emptyLabel));
+      return;
+    }
+    if (spans && spans.length) {
+      renderTextWithSpans(box, text, spans);
+    } else {
+      var pre = el('pre', 'anomaly-pre');
+      pre.textContent = text;
+      box.appendChild(pre);
+    }
+    if (unaligned) {
+      box.appendChild(el('div', 'anomaly-note',
+        '（检出位置无法与该区块精确对齐，高亮区间不可用）'));
+    }
+  }
+
+  function openAnomalyDetail(id) {
+    if (!currentInstance) return;
+    currentAnomalyId = id;
+    $('anomaly-title').textContent = '异常 #' + id;
+    $('anomaly-ill-badge').innerHTML = '';
+    $('anomaly-current-user').textContent = $('current-user').textContent || '';
+    ['anomaly-prompt', 'anomaly-reasoning', 'anomaly-text'].forEach(function (cid) {
+      $(cid).innerHTML = '';
+      $(cid).appendChild(el('div', 'anomaly-empty', '加载中…'));
+    });
+    $('anomaly-meta').innerHTML = '';
+    setView('anomaly');
+    loadAnomalyDetail();
+  }
+
+  async function loadAnomalyDetail() {
+    var inst = encodeURIComponent(currentInstance);
+    var id = currentAnomalyId;
+    var r = await api('/api/instances/' + inst + '/anomalies/' + id);
+    if (!currentInstance || currentAnomalyId !== id) return;
+    if (!r.ok || !r.data) {
+      var msg = r.status === 404
+        ? '记录不存在（可能已被清理，或实例未开启异常保存）'
+        : (r.data && r.data.detail) || '详情拉取失败，请稍后重试';
+      var meta = $('anomaly-meta');
+      meta.innerHTML = '';
+      meta.appendChild(el('div', 'anomaly-empty', msg));
+      ['anomaly-prompt', 'anomaly-reasoning', 'anomaly-text'].forEach(function (cid) {
+        $(cid).innerHTML = '';
+      });
+      return;
+    }
+    renderAnomalyDetail(r.data);
+  }
+
+  function renderAnomalyDetail(d) {
+    var loc = anomalyLocal(d);
+    var hitTotal = loc ? (loc.hits || []).length + (loc.windows || []).length : 0;
+    var meta = $('anomaly-meta');
+    meta.innerHTML = '';
+    var items = [
+      ['异常编号', '#' + d.id],
+      ['异常类型', illLabel(d.ill_type)],
+      ['模型', d.model || '-'],
+      ['检出时间', fmtFullTime(d.ts)],
+    ];
+    if (loc) {
+      var parts = [];
+      if ((loc.hits || []).length) parts.push('命中 ' + loc.hits.length + ' 处');
+      if ((loc.windows || []).length) parts.push('触发窗口 ' + loc.windows.length + ' 段');
+      items.push(['检出位置', parts.length ? parts.join(' · ') : '—']);
+      // 定位序列来源：text_tokenid=实际生成序列（可精确对齐）；回退=top-1 候选（采样差异）
+      items.push(['定位序列', loc.sequence_ref === 'text_tokenid'
+        ? '实际生成序列' : 'top-1 候选序列（回退，存在采样差异）']);
+      // 方案 B 重跑口径标识（design_anomaly_localization.md R2）：与线上检出区分
+      if (loc.source === 'rerun') {
+        var mark = '离线重跑';
+        if (loc.consistent === true) mark += '（与线上检出一致）';
+        else if (loc.consistent === false) mark += '（与线上检出不一致）';
+        items.push(['定位口径', mark]);
+      }
+      // 近似对齐标识：保存文本与重建存在细微差异，高亮仅映射可信区间
+      if (loc.align_mode === 'approx') {
+        items.push(['对齐方式', '近似对齐（文本细微差异，高亮按可信区间映射）']);
+      }
+    }
+    items.forEach(function (kv) {
+      meta.appendChild(el('div', 'anomaly-meta-item', kv[0] + '：' + kv[1]));
+    });
+    $('anomaly-ill-badge').innerHTML = illTag(d.ill_type);
+    fillAnomalySection('anomaly-prompt', promptToText(d.prompt), '（无 prompt 数据）');
+
+    // 思维链：按 reasoning_spans 高亮（后端按显示单元换算，未对齐时降级提示）。
+    // reasoning_end 为 null 说明思维链 token 不在 logprobs 序列内（无从对齐，
+    // 命中必在正文）——不提示，避免噪音。
+    // reasoning_content 缺失时用后端从 token 解码流提取的思维链（loc.reasoning_text）。
+    var reasonText = d.reasoning_content || (loc && loc.reasoning_text) || '';
+    var reasonUnaligned = !!(loc && hitTotal > 0 && reasonText &&
+      loc.reasoning_end != null && !loc.aligned_reasoning);
+    fillAnomalySectionSpans('anomaly-reasoning', reasonText,
+      (loc && loc.reasoning_spans) || [], '（无思维链内容）', reasonUnaligned);
+
+    var textBox = $('anomaly-text');
+    if (!loc) {
+      // 旧版记录：无位置信息，保持原样展示 + 提示
+      fillAnomalySection('anomaly-text', d.text || '', '（无输出文本）');
+      if (POSITION_ILL_TYPES[d.ill_type]) {
+        textBox.appendChild(el('div', 'anomaly-note',
+          '（该记录无检出位置信息：实例中间件或导入的 pkl 为旧版本，升级后新检出的异常将附带位置高亮）'));
+      }
+      return;
+    }
+    var textUnaligned = !!(hitTotal > 0 && d.text && !loc.aligned_text);
+    fillAnomalySectionSpans('anomaly-text', d.text || '',
+      (loc && loc.text_spans) || [], '（无输出文本）', textUnaligned);
+  }
+
+  function closeAnomalyDetail() {
+    currentAnomalyId = null;
+    setView('detail');
+    refreshNow();
   }
 
   // ------------------------------------------------------------------ //
@@ -966,6 +1293,8 @@
           '导入成功：' + data.imported + ' 条' +
           (data.skipped ? '（跳过 ' + data.skipped + '）' : '') +
           (data.cleared ? '，覆盖旧 ' + data.cleared + ' 条' : '') +
+          (data.anomalies_linked != null
+            ? '，联动实例表 ' + data.anomalies_linked + ' 条' : '') +
           (data.warning ? '；' + data.warning : '')
         );
         refreshNow();
@@ -1078,10 +1407,12 @@
     var name = encodeURIComponent(currentInstance);
     var summaryP = api('/api/instances/' + name + '/summary');
     var trendsP = api('/api/instances/' + name + '/trends?' + windowQuery(detailWindow));
+    var anomaliesP = api('/api/instances/' + name + '/anomalies?limit=500');
 
-    var results = await Promise.all([summaryP, trendsP]);
+    var results = await Promise.all([summaryP, trendsP, anomaliesP]);
     var summary = results[0];
     var trends = results[1];
+    var anomalies = results[2];
 
     if (summary.ok && summary.data) renderDetailSummary(summary.data);
     if (trends.ok && trends.data) {
@@ -1089,6 +1420,7 @@
       renderTrendNotice('detail-', trends.data);
       setWindowPie('detail-', detailWindow, trends.data);
     }
+    if (anomalies.ok && anomalies.data) renderAnomalies(anomalies.data);
   }
 
   function refreshNow() {
@@ -1179,6 +1511,20 @@
 
     // 导航：返回看板
     $('detail-back-btn').addEventListener('click', closeDetail);
+    // 异常详情页：返回实例详情
+    $('anomaly-back-btn').addEventListener('click', closeAnomalyDetail);
+    $('anomaly-logout-btn').addEventListener('click', logout);
+    // 异常实例分页
+    $('anomaly-prev').addEventListener('click', function () {
+      if (anomalyPage > 1) {
+        anomalyPage -= 1;
+        renderAnomalies(latestAnomalyData);
+      }
+    });
+    $('anomaly-next').addEventListener('click', function () {
+      anomalyPage += 1;
+      renderAnomalies(latestAnomalyData);
+    });
 
     // 告警铃铛：点击展开 / 收起面板
     $('bell').addEventListener('click', function (e) {

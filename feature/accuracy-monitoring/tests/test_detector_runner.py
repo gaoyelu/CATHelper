@@ -3,7 +3,8 @@ schedule_detection 指标（spec §2.5 §2.6 §2.7 §6.5, design §4.4）。
 
 重构后 runner 为 ProcessPoolExecutor 架构：
 - 构造期创建进程池，worker 初始化时构造 ILLDetector + 注入 tk2cat（无 lazy/无 _unusable）。
-- run_async(logprobs_list, token_ids_list) 经共享内存零拷贝检测，返回 [[is_ill, ill_type], ...]。
+- run_async(logprobs_list, token_ids_list) 经共享内存零拷贝检测，
+  返回 list[DetectionResult]（含 localization 命中详情）。
 - 进程池崩溃（BrokenProcessPool）→ 重建 + 计 error（spec §2.13）。
 """
 from __future__ import annotations
@@ -47,7 +48,11 @@ async def test_run_async_valid(vendored_config):
     runner = DetectorRunner(vendored_config, max_workers=1)
     lp, tid = _normal_arrays()
     results = await runner.run_async([lp], [tid])
-    assert results == [[False, 0]]
+    assert len(results) == 1
+    assert results[0].is_ill is False
+    assert results[0].ill_type == 0
+    assert results[0].hits == []
+    assert results[0].windows == []
     runner.shutdown()
 
 
@@ -101,7 +106,8 @@ async def test_detection_serialized_single_worker(vendored_config):
     runner = DetectorRunner(vendored_config, max_workers=1)
     lp, tid = _normal_arrays()
     for _ in range(3):
-        assert await runner.run_async([lp], [tid]) == [[False, 0]]
+        results = await runner.run_async([lp], [tid])
+        assert results[0].is_ill is False and results[0].ill_type == 0
     runner.shutdown()
 
 
@@ -118,7 +124,7 @@ async def test_runner_topk_n_truncates_larger_data(vendored_config):
     lp, tid = _arrays([{1: -0.1, 2: -0.2, 3: -0.3, 4: -0.4, 5: -0.5},
                        {1: -0.1, 2: -0.2, 3: -0.3, 4: -0.4, 5: -0.5}])
     results = await runner.run_async([lp], [tid])
-    assert results == [[False, 0]]
+    assert results[0].is_ill is False and results[0].ill_type == 0
     runner.shutdown()
 
 

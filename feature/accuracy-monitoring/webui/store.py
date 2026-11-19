@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Deque, List, Optional, Tuple
 
@@ -118,6 +118,10 @@ class InstanceStats:
     models_seen: set = field(default_factory=set)
     last_event: Optional[Tuple[str, float]] = None  # (ill_type, ts)
     detection_duration: Optional[Dict[str, float]] = None  # mean/p50/p95
+    # 异常记录拉取通道状态（/anomaly/anomalies）：
+    #   ok=正常拉取; disabled=实例未开启异常保存; unavailable=端点不可达/旧版中间件;
+    #   unknown=尚未轮询到
+    anomaly_feed: str = "unknown"
 
 
 class RingBuffer:
@@ -163,6 +167,11 @@ class Store:
         self._next_event_id = 1
         self._next_alert_id = 1
         self.detection_duration: Optional[Dict[str, float]] = None
+        # 异常实例（元数据环形缓冲，per 实例）+ 详情 LRU 缓存
+        self._anomalies: Dict[str, RingBuffer] = {}
+        self._anomaly_details: "OrderedDict[Tuple[str, int], Dict[str, Any]]" = OrderedDict()
+        # 导入历史的本地详情库（per 实例，id 升序插入、超容量淘汰最小编号）
+        self._imported_details: Dict[str, "OrderedDict[int, Dict[str, Any]]"] = {}
 
     # ------------------------------------------------------------------ #
     # 事件
@@ -198,6 +207,91 @@ class Store:
                 if len(out) >= limit:
                     break
         return out
+
+    # ------------------------------------------------------------------ #
+    # 异常实例（元数据 + 详情缓存，来源：/anomaly/anomalies 增量拉取）
+    # ------------------------------------------------------------------ #
+    def set_anomaly_feed(self, name: str, state: str) -> None:
+        self._stats_for(name).anomaly_feed = state
+
+    def add_anomaly_meta(self, instance: str, meta: Dict[str, Any]) -> bool:
+        """追加一条异常元数据（按 id 去重）；新增返回 True。"""
+        buf = self._anomalies.get(instance)
+        if buf is None:
+            buf = RingBuffer(self.cfg.anomaly_capacity)
+            self._anomalies[instance] = buf
+        aid = meta.get("id")
+        for m in buf:
+            if m.get("id") == aid:
+                return False
+        buf.append(dict(meta))
+        return True
+
+    def upsert_anomaly_meta(self, instance: str, meta: Dict[str, Any]) -> None:
+        """按 id 覆盖插入异常元数据（导入联动用）。
+
+        与 add_anomaly_meta 的去重语义不同：同 id 旧记录（含实时轮询拉到的）
+        被导入记录替换并打上 source=imported 标，保证「导入 → 表格可见」。
+        """
+        aid = meta.get("id")
+        buf = self._anomalies.get(instance)
+        if buf is None:
+            buf = RingBuffer(self.cfg.anomaly_capacity)
+            self._anomalies[instance] = buf
+        buf.remove_where(lambda m: m.get("id") == aid)
+        buf.append(dict(meta))
+
+    def recent_anomalies(self, instance: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """该实例最近 limit 条异常元数据（id 倒序，最新在前）。"""
+        buf = self._anomalies.get(instance)
+        if buf is None:
+            return []
+        return buf.latest(limit)
+
+    def get_anomaly_detail(self, instance: str, anomaly_id: int) -> Optional[Dict[str, Any]]:
+        aid = int(anomaly_id)
+        d = self._anomaly_details.get((instance, aid))
+        if d is not None:
+            return d
+        return self._imported_details.get(instance, OrderedDict()).get(aid)
+
+    def put_anomaly_detail(self, instance: str, anomaly_id: int, detail: Dict[str, Any]) -> None:
+        key = (instance, int(anomaly_id))
+        self._anomaly_details.pop(key, None)
+        self._anomaly_details[key] = detail
+        while len(self._anomaly_details) > self.cfg.anomaly_detail_cache:
+            self._anomaly_details.popitem(last=False)
+
+    def _put_imported_details(self, instance: str, details: List[Dict[str, Any]]) -> None:
+        """批量写入导入详情（有界：超 anomaly_capacity 淘汰最小编号）。"""
+        if not details:
+            return
+        od = self._imported_details.get(instance)
+        if od is None:
+            od = OrderedDict()
+            self._imported_details[instance] = od
+        for d in sorted(details, key=lambda x: x.get("id", 0)):
+            try:
+                od[int(d["id"])] = d
+            except (TypeError, ValueError):
+                continue
+            while len(od) > self.cfg.anomaly_capacity:
+                od.popitem(last=False)
+
+    def _remove_imported_anomalies(self, instance: str) -> int:
+        """移除该实例 source=imported 的异常元数据与详情缓存；返回移除元数据条数。"""
+        removed = 0
+        buf = self._anomalies.get(instance)
+        if buf is not None:
+            before = len(buf)
+            buf.remove_where(lambda m: m.get("source") == "imported")
+            removed = before - len(buf)
+        self._imported_details.pop(instance, None)
+        # LRU 中可能缓存过点击过的导入详情 → 一并清除，防重导入后读到旧数据
+        for key in [k for k, v in self._anomaly_details.items()
+                    if k[0] == instance and v.get("source") == "imported"]:
+            del self._anomaly_details[key]
+        return removed
 
     # ------------------------------------------------------------------ #
     # 实例统计 + 全局聚合
@@ -461,11 +555,15 @@ class Store:
         instance: str,
         anomaly_events: List[AnomalyEvent],
         trend_events: List["TrendEvent"],
+        anomaly_metas: Optional[List[Dict[str, Any]]] = None,
+        anomaly_details: Optional[List[Dict[str, Any]]] = None,
         now: Optional[float] = None,
     ) -> int:
         """将导入的异常事件应用到所有模块（事件列表、实例统计、趋势、全局 KPI）。
 
         覆盖语义：先回滚该实例上一次导入的计数与事件，再追加新数据。
+        anomaly_metas / anomaly_details（source=imported）联动异常实例表格与
+        本地详情库：先移除旧导入元数据与详情，再追加新数据。
         返回被覆盖清除的旧趋势事件条数。
         """
         # 1. 回滚上一次导入
@@ -488,12 +586,19 @@ class Store:
                 and getattr(e, "source", "live") == "imported"
             )
 
-        # 2. 清旧导入趋势事件
+        # 2. 清旧导入趋势事件 + 旧导入异常元数据/详情
         cleared = self.clear_imported_trend_events(instance)
+        self._remove_imported_anomalies(instance)
 
         # 3. 追加新事件到环形缓冲
         for e in anomaly_events:
             self.events.append(e)
+
+        # 3.5 异常实例联动：按 id 覆盖插入新元数据（同 id 旧记录被导入记录替换）
+        # 与详情写入一致按 id 升序插入，保证表格 id 倒序展示
+        for m in sorted(anomaly_metas or [], key=lambda x: x.get("id", 0)):
+            self.upsert_anomaly_meta(instance, m)
+        self._put_imported_details(instance, anomaly_details or [])
 
         # 4. 追加新趋势事件
         self.append_trend_events(trend_events, now=now)
@@ -527,6 +632,10 @@ class Store:
         )
         self._imported.pop(name, None)
         self._stats.pop(name, None)
+        self._anomalies.pop(name, None)
+        self._imported_details.pop(name, None)
+        for key in [k for k in self._anomaly_details if k[0] == name]:
+            del self._anomaly_details[key]
 
     def summary(self) -> Dict[str, Any]:
         stats = list(self._stats.values())

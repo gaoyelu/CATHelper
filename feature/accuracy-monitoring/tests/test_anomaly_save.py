@@ -299,6 +299,151 @@ async def test_schedule_detection_text_tokenid_defaults_empty(tmp_path):
     assert data[1]["reasoning_content"] is None
 
 
+# --------------------------- localization 落盘（design_anomaly_localization.md） --------------------------- #
+class _FakeResolver:
+    def __init__(self, mapping):
+        self._m = mapping
+
+    def resolve(self, token_id):
+        return self._m.get(int(token_id))
+
+
+def _detection_result(ill_type, hits=None, windows=None):
+    from anomaly_middleware.detector import DetectionResult
+    return DetectionResult(
+        is_ill=True, ill_type=ill_type,
+        hits=hits or [], windows=windows or [],
+    )
+
+
+async def test_schedule_detection_saves_localization_with_resolver(tmp_path):
+    """DetectionResult + resolver：record 携带完整 localization（字符对齐 + 区间）。"""
+    fp = tmp_path / "anom.pkl"
+    store = AnomalyStore(save_path=str(fp))
+    metrics = Metrics()
+    runner = _FakeRunner([_detection_result(1, hits=[{"idx": 2, "token_id": 30, "logp_top1": -8.2}])])
+    lp = [np.array([[0.1], [0.2], [0.3]], dtype=np.float32)]
+    tid = [np.array([[10], [20], [30]], dtype=np.int32)]
+    resolver = _FakeResolver({10: "你", 20: "好", 30: "鿊"})
+    task = schedule_detection(
+        runner, lp, tid,
+        request_id="req-l1", model="m", metrics=metrics,
+        pending_tasks=set(),
+        anomaly_store=store, prompt="p", texts=["你好鿊"],
+        text_tokenids=[[10, 20, 30]],
+        reasoning_contents=[None],
+        resolver=resolver,
+    )
+    await task
+    with open(fp, "rb") as f:
+        data = pickle.load(f)
+    loc = data[1]["localization"]
+    assert loc["detector_ver"] == 2
+    assert loc["sequence_ref"] == "text_tokenid"
+    assert loc["char_offsets"] == [0, 1, 2]
+    assert loc["align_text"] == "你好鿊"
+    assert loc["aligned_text"] is True
+    assert loc["text_spans"][0]["start"] == 2
+    assert loc["hits"][0]["idx"] == 2
+    # metrics / record 主字段不受影响
+    assert data[1]["ill_type"] == 1
+    assert data[1]["text"] == "你好鿊"
+
+
+async def test_schedule_detection_saves_localization_legacy_result(tmp_path):
+    """旧格式结果 [is_ill, ill_type]（测试/e2e 注入）：localization 降级块（无命中）。"""
+    fp = tmp_path / "anom.pkl"
+    store = AnomalyStore(save_path=str(fp))
+    metrics = Metrics()
+    runner = _FakeRunner([[True, 1]])
+    lp = [np.array([[0.1]], dtype=np.float32)]
+    tid = [np.array([[10]], dtype=np.int32)]
+    task = schedule_detection(
+        runner, lp, tid,
+        request_id="req-l2", model="m", metrics=metrics,
+        pending_tasks=set(),
+        anomaly_store=store, prompt="p", texts=["t"],
+        text_tokenids=[[10]],
+        reasoning_contents=[None],
+        resolver=_FakeResolver({10: "t"}),
+    )
+    await task
+    with open(fp, "rb") as f:
+        data = pickle.load(f)
+    loc = data[1]["localization"]
+    assert loc["detector_ver"] == 2
+    assert loc["hits"] == [] and loc["windows"] == []
+    assert loc["char_offsets"] is None  # 无命中 → 不做字符对齐
+
+
+async def test_schedule_detection_localization_nan_minimal(tmp_path):
+    """NaN：localization 最小契约（无位置）。"""
+    fp = tmp_path / "anom.pkl"
+    store = AnomalyStore(save_path=str(fp))
+    metrics = Metrics()
+    runner = _FakeRunner([_detection_result(4)])
+    lp = [np.array([[float("nan")]], dtype=np.float32)]
+    tid = [np.array([[10]], dtype=np.int32)]
+    task = schedule_detection(
+        runner, lp, tid,
+        request_id="req-l3", model="m", metrics=metrics,
+        pending_tasks=set(),
+        anomaly_store=store, prompt="p", texts=["x"],
+        text_tokenids=[[10]],
+        reasoning_contents=[None],
+        resolver=_FakeResolver({10: "x"}),
+    )
+    await task
+    with open(fp, "rb") as f:
+        data = pickle.load(f)
+    loc = data[1]["localization"]
+    assert loc["hits"] == []
+    assert loc["char_offsets"] is None
+
+
+async def test_schedule_detection_localization_windows(tmp_path):
+    """乱码窗口：windows 经 build_localization 清洗后入 record。"""
+    fp = tmp_path / "anom.pkl"
+    store = AnomalyStore(save_path=str(fp))
+    metrics = Metrics()
+    runner = _FakeRunner([
+        _detection_result(2, windows=[{"start": 0, "end": 2, "kind": "garbled"}]),
+    ])
+    lp = [np.array([[0.1], [0.2]], dtype=np.float32)]
+    tid = [np.array([[10], [11]], dtype=np.int32)]
+    task = schedule_detection(
+        runner, lp, tid,
+        request_id="req-l4", model="m", metrics=metrics,
+        pending_tasks=set(),
+        anomaly_store=store, prompt="p", texts=["鿊鿊"],
+        text_tokenids=[[10, 11]],
+        reasoning_contents=[None],
+        resolver=_FakeResolver({10: "鿊", 11: "鿊"}),
+    )
+    await task
+    with open(fp, "rb") as f:
+        data = pickle.load(f)
+    loc = data[1]["localization"]
+    assert loc["windows"] == [{"start": 0, "end": 2, "kind": "garbled"}]
+    assert loc["text_spans"] == [{
+        "start": 0, "end": 2, "kind": "garbled", "ref": "0-2",
+        "title": "乱码触发窗口 [0,2)",
+    }]
+
+
+def test_record_detection_accepts_detection_result():
+    """record_detection 兼容 DetectionResult / dict / 列表三种形态。"""
+    from anomaly_middleware.detector import DetectionResult
+    m = Metrics()
+    m.record_detection([DetectionResult(is_ill=True, ill_type=1)], "m1")
+    m.record_detection([{"is_ill": True, "ill_type": 2}], "m2")
+    m.record_detection([[True, 3]], "m3")
+    out = m.render_metrics().decode("utf-8")
+    assert 'ill_type="1"' in out and 'model="m1"' in out
+    assert 'ill_type="2"' in out and 'model="m2"' in out
+    assert 'ill_type="3"' in out and 'model="m3"' in out
+
+
 # --------------------------- SSE 文本累积（供异常保存）--------------------------- #
 def _entry(token_id, logprob=-0.1, n=3):
     tps = [
@@ -444,6 +589,61 @@ def test_sse_chat_reasoning_content_accumulation():
     assert len(tokenids[0]) == 2  # thinking + output = 2 tokens
 
 
+def test_extract_reasoning_field_dual_key():
+    from anomaly_middleware.extractor import extract_reasoning_field
+
+    assert extract_reasoning_field({"reasoning": "new"}) == "new"
+    assert extract_reasoning_field({"reasoning_content": "old"}) == "old"
+    assert extract_reasoning_field(
+        {"reasoning": "new", "reasoning_content": "old"}
+    ) == "new"
+    assert extract_reasoning_field({"reasoning": None, "reasoning_content": "old"}) == "old"
+    assert extract_reasoning_field({"reasoning": None}) is None
+    assert extract_reasoning_field({"reasoning": 123}) is None
+    assert extract_reasoning_field({}) is None
+    assert extract_reasoning_field(None) is None
+    assert extract_reasoning_field("reasoning") is None
+
+
+def test_sse_chat_reasoning_new_key_accumulation():
+    sse = SSEStreamProcessor(True, _orig(True), 3, resolver=None)
+    e = _entry(100)
+    # thinking chunk: delta.reasoning（新版 vLLM 键名）, no delta.content
+    sse.feed(_sse_bytes({
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": {"reasoning": "think"},
+            "logprobs": {"content": [dict(e)]},
+            "finish_reason": None,
+        }],
+    }))
+    sse.feed(_sse_bytes(_chat_chunk("answer", e)))
+    sse.feed(b"data: [DONE]\n\n")
+    sse.flush()
+    assert sse.get_choice_texts() == ["answer"]
+    assert sse.get_choice_reasoning_contents() == ["think"]
+    tokenids = sse.get_choice_text_tokenids()
+    assert len(tokenids[0]) == 2
+
+
+def test_sse_chat_reasoning_dual_key_no_double_accumulation():
+    sse = SSEStreamProcessor(True, _orig(True), 3, resolver=None)
+    e = _entry(100)
+    sse.feed(_sse_bytes({
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": {"reasoning": "think", "reasoning_content": "think"},
+            "logprobs": {"content": [dict(e)]},
+            "finish_reason": None,
+        }],
+    }))
+    sse.feed(b"data: [DONE]\n\n")
+    sse.flush()
+    assert sse.get_choice_reasoning_contents() == ["think"]
+
+
 def test_sse_completions_text_tokenids():
     sse = SSEStreamProcessor(False, _orig(False), 3, resolver=None)
     sse.feed(_sse_bytes(_comp_chunk("foo", 100)))
@@ -521,6 +721,35 @@ async def test_interceptor_nonstream_completions_text_tokenids():
 
     assert interceptor.get_choice_text_tokenids() == [[100, 200]]
     assert interceptor.get_choice_reasoning_contents() == [None]
+
+
+async def test_interceptor_nonstream_chat_reasoning_new_key():
+    from anomaly_middleware.middleware import ResponseInterceptor, RequestContext
+
+    sent = []
+    async def send(msg):
+        sent.append(msg)
+
+    ctx = RequestContext(
+        orig=OriginalParams(is_chat=True, logprobs=True, top_logprobs=3,
+                           return_tokens_as_token_ids=False, n=1, stream=False),
+        is_chat=True, model="m", request_id="r", will_detect=True, top_logprobs=3,
+    )
+    interceptor = ResponseInterceptor(
+        send, ctx=ctx, runner=None, metrics=Metrics(),
+        pending_tasks=set(), resolver=None, anomaly_store=None,
+    )
+    from _helpers import chat_top_entry, build_chat_response
+    NI = "你"
+    e1 = chat_top_entry(100, NI, -0.1, n_top=5)
+    data = build_chat_response("m", [e1], reasoning="thinking-new")
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+    await interceptor({"type": "http.response.start", "status": 200, "headers": []})
+    await interceptor({"type": "http.response.body", "body": body, "more_body": False})
+
+    assert interceptor.get_choice_reasoning_contents() == ["thinking-new"]
+    assert interceptor.get_choice_texts() == ["x"]
 
 
 async def test_interceptor_streaming_chat_text_tokenids_and_reasoning():

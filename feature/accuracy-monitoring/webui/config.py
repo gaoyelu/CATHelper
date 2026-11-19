@@ -32,7 +32,7 @@ CONFIG_PATH_DEFAULT = "configs/webui.yaml"
 ILL_TYPES: Tuple[str, ...] = ("rare_character", "garbled", "repetition", "nan_value")
 
 # 非动态配置段：变更仅记日志，需要重启服务
-NON_DYNAMIC_SECTIONS = ("poll", "store", "webhooks", "email", "alerts")
+NON_DYNAMIC_SECTIONS = ("poll", "store", "webhooks", "email", "alerts", "models")
 
 
 class ConfigError(Exception):
@@ -122,6 +122,54 @@ class PollConfig:
 
 
 @dataclass(frozen=True)
+class ModelRerunConfig:
+    """单模型的离线重跑定位配置（design_anomaly_localization.md §6.2，可选）。
+
+    全部字段可省略：未配置 tokenizer/token2category 时重跑仅产出 token 索引级
+    定位（hits/windows，无字符对齐）；detector_config 缺省用仓库 configs/detector.yaml。
+    """
+
+    tokenizer_path: str = ""          # 可选：tokenizer 目录/名称，提供则可解码 token 文本
+    token2category_path: str = ""     # 可选：预生成词表类别映射 JSON，提供则按有词表模式重跑
+    detector_config: str = ""         # 可选：检测器配置 yaml 覆盖（缺省 configs/detector.yaml）
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any], where: str) -> "ModelRerunConfig":
+        d = d or {}
+
+        def _opt(key: str) -> str:
+            v = d.get(key)
+            if v is None:
+                return ""
+            s = str(v).strip()
+            if not s:
+                raise ConfigError(f"{where}.{key} 不能为空字符串（可省略该字段）")
+            return s
+
+        return cls(
+            tokenizer_path=_opt("tokenizer_path"),
+            token2category_path=_opt("token2category_path"),
+            detector_config=_opt("detector_config"),
+        )
+
+    @classmethod
+    def parse_models(cls, data: Mapping[str, Any]) -> "Tuple[Tuple[str, ModelRerunConfig], ...]":
+        """解析 models 段：{模型名: {tokenizer_path/token2category_path/detector_config}}。"""
+        models_raw = data.get("models") or {}
+        if not isinstance(models_raw, dict):
+            raise ConfigError("models: 必须是映射（模型名 → 配置对象）")
+        out: List[Tuple[str, ModelRerunConfig]] = []
+        for name, m in models_raw.items():
+            name = str(name).strip()
+            if not name:
+                raise ConfigError("models: 模型名不能为空")
+            if m is not None and not isinstance(m, Mapping):
+                raise ConfigError(f"models({name}): 必须是映射")
+            out.append((name, cls.from_dict(m, f"models({name})")))
+        return tuple(out)
+
+
+@dataclass(frozen=True)
 class InstanceConfig:
     name: str
     url: str
@@ -151,6 +199,10 @@ class StoreConfig:
     raw_trend_window_seconds: int = 3600
     trend_bucket_seconds: int = 60
     trend_horizon_seconds: int = 2592000  # 30 天（阶梯趋势事件保留上限）
+    # 每实例异常元数据环形缓冲容量（来源：中间件 /anomaly/anomalies 增量拉取）
+    anomaly_capacity: int = 2000
+    # 异常详情 LRU 缓存条数（按需拉取的全量记录缓存，超出淘汰最旧，可重新拉取）
+    anomaly_detail_cache: int = 50
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "StoreConfig":
@@ -159,6 +211,8 @@ class StoreConfig:
         raw = _positive_number(d, "raw_trend_window_seconds", "store") if "raw_trend_window_seconds" in d else 3600
         bucket = _positive_number(d, "trend_bucket_seconds", "store") if "trend_bucket_seconds" in d else 60
         horizon = _positive_number(d, "trend_horizon_seconds", "store") if "trend_horizon_seconds" in d else 2592000
+        anomaly_cap = _positive_number(d, "anomaly_capacity", "store") if "anomaly_capacity" in d else 2000
+        detail_cache = _positive_number(d, "anomaly_detail_cache", "store") if "anomaly_detail_cache" in d else 50
         if raw >= horizon:
             raise ConfigError(
                 f"store: raw_trend_window_seconds({raw}) 必须小于 trend_horizon_seconds({horizon})"
@@ -173,6 +227,8 @@ class StoreConfig:
             raw_trend_window_seconds=raw,
             trend_bucket_seconds=bucket,
             trend_horizon_seconds=horizon,
+            anomaly_capacity=anomaly_cap,
+            anomaly_detail_cache=detail_cache,
         )
 
 
@@ -300,6 +356,7 @@ class WebUIConfig:
     webhooks: WebhooksConfig
     email: EmailConfig
     alerts: Tuple[AlertRule, ...]
+    models: Tuple[Tuple[str, ModelRerunConfig], ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "WebUIConfig":
@@ -309,6 +366,7 @@ class WebUIConfig:
         store = StoreConfig.from_dict(data.get("store", {}) or {})
         webhooks = WebhooksConfig.from_dict(data.get("webhooks", {}) or {})
         email = EmailConfig.from_dict(data.get("email", {}) or {})
+        models = ModelRerunConfig.parse_models(data)
 
         instances = tuple(
             InstanceConfig.from_dict(d, "instances") for d in (data.get("instances", []) or [])
@@ -334,6 +392,7 @@ class WebUIConfig:
             webhooks=webhooks,
             email=email,
             alerts=alerts,
+            models=models,
         )
 
     @classmethod

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>推理精度异常监控</title>
-  <link rel="stylesheet" href="/css/style.css?v=5">
+  <link rel="stylesheet" href="/css/style.css?v=7">
 </head>
 <body>
   <!-- ============ 登录页 ============ -->
@@ -227,6 +227,78 @@
         </div>
       </section>
       <div id="detail-type-legend" class="legend-row"></div>
+
+      <!-- 异常实例列表（来源：实例 /anomaly/anomalies） -->
+      <section class="card">
+        <div class="card-header">
+          <h2>异常实例</h2>
+          <span id="detail-anomaly-hint" class="chart-notice hidden"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="detail-anomalies-table">
+            <thead>
+              <tr>
+                <th>异常编号</th>
+                <th>异常类型</th>
+                <th>模型</th>
+                <th>检出时间</th>
+                <th>位置数</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="anomaly-pager" class="pager hidden">
+          <button id="anomaly-prev" class="btn btn-xs btn-ghost">&#8249; 上一页</button>
+          <span id="anomaly-page-info" class="pager-info"></span>
+          <button id="anomaly-next" class="btn btn-xs btn-ghost">下一页 &#8250;</button>
+        </div>
+        <div id="detail-anomalies-empty" class="chart-placeholder hidden">暂无异常记录</div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ============ 异常详情页 ============ -->
+  <div id="anomaly-detail" class="page hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand">异常详情</span>
+        <nav class="nav">
+          <button id="anomaly-back-btn" class="nav-item" title="返回实例详情">&#8592; 返回实例详情</button>
+        </nav>
+      </div>
+      <div class="topbar-right">
+        <span id="anomaly-current-user" class="user"></span>
+        <button id="anomaly-logout-btn" class="btn btn-ghost">退出</button>
+      </div>
+    </header>
+
+    <div class="container">
+      <section class="detail-title">
+        <span id="anomaly-title" class="detail-name"></span>
+        <span id="anomaly-ill-badge" class="inst-status-inline"></span>
+      </section>
+
+      <section class="card">
+        <div class="card-header"><h2>基本信息</h2></div>
+        <div id="anomaly-meta" class="anomaly-meta"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header"><h2>Prompt（用户输入）</h2></div>
+        <div id="anomaly-prompt" class="anomaly-content"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header"><h2>思维链（reasoning）</h2></div>
+        <div id="anomaly-reasoning" class="anomaly-content"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header"><h2>模型输出</h2></div>
+        <div id="anomaly-text" class="anomaly-content"></div>
+      </section>
     </div>
   </div>
 
@@ -244,6 +316,6 @@
   <div id="toast" class="toast hidden"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-  <script src="/js/app.js?v=5"></script>
+  <script src="/js/app.js?v=7"></script>
 </body>
 </html>

@@ -105,6 +105,16 @@ def test_static_resolver_basic():
     assert r._cache[2] == "你"       # 缓存命中
 
 
+def test_static_resolver_decode_ids_join():
+    """decode_ids（组解码 best effort）：逐 id 查表拼接。"""
+    r = pi.StaticTokenTextResolver({"0": "你", "1": "好", "2": "。"})
+    assert r.decode_ids([0, 1, 2]) == "你好。"
+    assert r.decode_ids((0,)) == "你"
+    assert r.decode_ids([]) is None
+    assert r.decode_ids([0, 999]) is None   # 表缺失 → None（不完整单元）
+    assert r.decode_ids([0, 1]) == "你好"   # 缓存不干扰拼接
+
+
 def test_load_token2category(tmp_path):
     f = tmp_path / "m_100.json"
     f.write_text(json.dumps({"0": "chinese_cjk", "5": "english_latin"}), encoding="utf-8")

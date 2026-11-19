@@ -108,12 +108,15 @@ class Metrics:
 
     def record_detection(
         self,
-        results: Sequence[Sequence],
+        results: Sequence,
         model: str,
     ) -> None:
         """记录一次检测（对应一个 HTTP 请求的 n 个候选结果）。
 
-        results: list[[is_ill, ill_type]]，与 choice 平行。
+        results 与 choice 平行，元素兼容三种形态：
+        - DetectionResult（is_ill/ill_type 属性）；
+        - dict（含 is_ill/ill_type 键）；
+        - [is_ill, ill_type] 列表（旧格式）。
         - 按请求计数：requests_total +1（无论正常/异常）。
         - 每个异常候选：detected_total{ill_type,model,choice_index} +1。
         - 正常（ill_type=0）只增 requests，不计 detected（§3.7）。
@@ -124,10 +127,17 @@ class Metrics:
             self.requests_total.inc()
             seen_types = set()
             for idx, res in enumerate(results):
-                if not res or len(res) < 2:
+                try:
+                    if hasattr(res, "is_ill") and hasattr(res, "ill_type"):
+                        is_ill, ill_type = bool(res.is_ill), int(res.ill_type)
+                    elif isinstance(res, dict):
+                        is_ill, ill_type = bool(res.get("is_ill")), int(res.get("ill_type") or 0)
+                    elif res and len(res) >= 2:
+                        is_ill, ill_type = bool(res[0]), int(res[1])
+                    else:
+                        continue
+                except (TypeError, ValueError, IndexError):
                     continue
-                is_ill = bool(res[0])
-                ill_type = int(res[1])
                 if is_ill and ill_type != ILL_NORMAL:
                     self.detected_total.labels(
                         ill_type=str(ill_type),

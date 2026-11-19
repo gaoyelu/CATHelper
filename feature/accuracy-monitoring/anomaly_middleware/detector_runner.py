@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import shared_memory
-from typing import Any, List, Optional, Sequence, Set
+from typing import Any, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -39,7 +39,10 @@ def _worker_init(config_path: str, tk2cat, vocab_size: int, topk_n: int):
 
 
 def _detect_sync(metadata: dict):
-    """worker 检测入口：从共享内存零拷贝读取 → 逐候选检测 → 返回结果。"""
+    """worker 检测入口：从共享内存零拷贝读取 → 逐候选检测 → 返回结果。
+
+    返回 list[DetectionResult]（含 localization 命中详情，可 pickle）。
+    """
     shm = shared_memory.SharedMemory(name=metadata["shm_name"])
     try:
         off = metadata["offsets"]
@@ -58,7 +61,7 @@ def _detect_sync(metadata: dict):
         for i in range(metadata["num_choices"]):
             n = metadata["choice_lengths"][i]
             res = det.detector(logprobs[i][:n], token_ids[i][:n], topk_n=topk_n)
-            results.append([res.is_ill, res.ill_type])
+            results.append(res)
         return results
     finally:
         shm.close()
@@ -189,6 +192,30 @@ class DetectorRunner:
             pass
 
 
+def normalize_result(res: Any) -> Tuple[bool, int, list, list]:
+    """归一化检测结果为 (is_ill, ill_type, hits, windows)。
+
+    兼容三种形态：
+    - DetectionResult（新，worker 返回）；
+    - dict（含 is_ill/ill_type/hits/windows）；
+    - [is_ill, ill_type] 列表（旧格式 / 测试 / e2e 注入 override）。
+    """
+    if hasattr(res, "is_ill") and hasattr(res, "ill_type"):
+        return (
+            bool(res.is_ill), int(res.ill_type),
+            list(getattr(res, "hits", []) or []),
+            list(getattr(res, "windows", []) or []),
+        )
+    if isinstance(res, dict):
+        return (
+            bool(res.get("is_ill")), int(res.get("ill_type") or 0),
+            list(res.get("hits") or []), list(res.get("windows") or []),
+        )
+    if res and len(res) >= 2:
+        return bool(res[0]), int(res[1]), [], []
+    return False, 0, [], []
+
+
 def schedule_detection(
     runner: DetectorRunner,
     logprobs_list: List[np.ndarray],
@@ -203,11 +230,13 @@ def schedule_detection(
     texts: Optional[Sequence] = None,
     text_tokenids: Optional[Sequence[Sequence[int]]] = None,
     reasoning_contents: Optional[Sequence[Optional[str]]] = None,
+    resolver: Any = None,
 ) -> asyncio.Task:
     """fire-and-forget 检测任务。异常全捕获计 error，不影响客户端。
 
     若传入 anomaly_store，则对每个异常候选保存现场（编号 + pickle 落盘）
-    并经 metrics 暴露最新异常编号/时间戳。
+    并经 metrics 暴露最新异常编号/时间戳。resolver 用于构建 localization
+    （token → 文本对齐），构建失败仅降级（无位置信息），不影响保存。
     """
 
     async def _run() -> None:
@@ -231,34 +260,69 @@ def schedule_detection(
                 metrics.record_error()
         # 异常信息保存（不计入检测耗时；保存失败不影响客户端/检测/后续请求）
         if results is not None and anomaly_store is not None:
-            try:
-                ts = time.time()
-                for idx, res in enumerate(results):
-                    if not res or len(res) < 2:
+            loop = asyncio.get_running_loop()
+            ts = time.time()
+            for idx in range(len(results)):
+                try:
+                    res = results[idx]
+                    if res is None or (isinstance(res, (list, tuple)) and len(res) < 2):
                         continue
-                    is_ill = bool(res[0])
-                    ill_type = int(res[1])
+                    is_ill, ill_type, hits, windows = normalize_result(res)
                     if not (is_ill and ill_type != ILL_NORMAL):
                         continue  # 仅异常候选
                     lp = logprobs_list[idx] if idx < len(logprobs_list) else None
                     tid = token_ids_list[idx] if idx < len(token_ids_list) else None
+                    text = texts[idx] if texts and idx < len(texts) else None
+                    tokids = (
+                        text_tokenids[idx]
+                        if text_tokenids and idx < len(text_tokenids) else None
+                    )
+                    reasoning = (
+                        reasoning_contents[idx]
+                        if reasoning_contents and idx < len(reasoning_contents) else None
+                    )
+                    # localization 构建（含逐 token 解码，CPU 密集 → 线程 offload）
+                    localization = None
+                    try:
+                        from .localization import build_localization
+
+                        localization = await loop.run_in_executor(
+                            None,
+                            lambda: build_localization(
+                                ill_type=ill_type,
+                                hits=hits,
+                                windows=windows,
+                                tokenids=tokids,
+                                text=text,
+                                reasoning_content=reasoning,
+                                resolver=resolver,
+                                seq_len=len(tid) if tid is not None else 0,
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "localization 构建失败 request_id=%s 异常候选 %d: %s",
+                            request_id, idx, exc,
+                        )
                     record = {
                         "time": ts,
                         "prompt": prompt,
                         "ill_type": ill_type,
                         "topk_logprobs": lp.tolist() if lp is not None else [],
                         "tokens_ids": tid.tolist() if tid is not None else [],
-                        "text": texts[idx] if texts and idx < len(texts) else None,
-                        "text_tokenid": text_tokenids[idx] if text_tokenids and idx < len(text_tokenids) else [],
-                        "reasoning_content": reasoning_contents[idx] if reasoning_contents and idx < len(reasoning_contents) else None,
+                        "text": text,
+                        "text_tokenid": tokids if tokids is not None else [],
+                        "reasoning_content": reasoning,
                         "model_name": model,
+                        "localization": localization,
                     }
                     aid = await anomaly_store.save(record)
                     metrics.record_anomaly(aid, ts, model)
-            except Exception as exc:
-                logger.error(
-                    "异常信息保存失败 request_id=%s: %s", request_id, exc,
-                )
+                except Exception as exc:
+                    logger.error(
+                        "异常信息保存失败 request_id=%s 候选 %d: %s",
+                        request_id, idx, exc,
+                    )
 
     task = asyncio.create_task(_run())
     pending_tasks.add(task)

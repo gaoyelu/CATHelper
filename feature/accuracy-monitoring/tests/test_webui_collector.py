@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from webui.alerts import AlertEngine, AlertRule
-from webui.collector import Collector, MetricsParseError, parse_metrics_text
+from webui.collector import Collector, MetricsParseError, PollError, parse_metrics_text
 from webui.config import InstanceConfig, PollConfig, StoreConfig
 from webui.events import AnomalyEvent, DeltaSummary, EventSynthesizer
 from webui.store import Store
@@ -83,10 +83,22 @@ def test_parse_empty_text():
 # 轮询 + 增量
 # ------------------------------------------------------------------ #
 class FakeClient:
+    """按 URL 路由的假客户端：metrics 响应走 responses，异常列表走 anomaly_responses。
+
+    anomaly_responses 未配置时默认返回 enabled=false（feed=disabled，不影响既有断言）。
+    """
+
     def __init__(self):
         self.responses = []
+        self.anomaly_responses = []
 
     async def get(self, url):
+        if "/anomaly/anomalies" in url:
+            if self.anomaly_responses:
+                return self.anomaly_responses.pop(0)
+            return httpx.Response(200, json={
+                "enabled": False, "latest_id": 0, "total": 0, "records": [],
+            })
         return self.responses.pop(0)
 
     async def aclose(self):
@@ -298,3 +310,129 @@ async def test_collector_integrated_with_store_and_alerts():
     alert = store.recent_alerts(10)[0]
     assert alert.count == 2
     assert alert.ill_type == "garbled"
+
+
+# ------------------------------------------------------------------ #
+# 异常记录增量拉取（/anomaly/anomalies）
+# ------------------------------------------------------------------ #
+def _anomalies_payload(records, latest=None, enabled=True):
+    return httpx.Response(200, json={
+        "enabled": enabled,
+        "latest_id": latest if latest is not None else max(
+            [r["id"] for r in records], default=0),
+        "total": len(records),
+        "records": records,
+    })
+
+
+async def test_poll_anomalies_fetches_on_baseline_and_delta():
+    store = _store()
+    col = _collector(store)
+    col._client = FakeClient()
+    col._instances = {"a": InstanceConfig(name="a", url="http://v:8000")}
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(2, []))]
+    col._client.anomaly_responses = [_anomalies_payload([
+        {"id": 1, "time": 1.0, "ill_type": 2, "model_name": "m"},
+        {"id": 2, "time": 2.0, "ill_type": 1, "model_name": "m"},
+        {"id": 3, "time": 3.0, "ill_type": 3, "model_name": "m2"},
+    ])]
+
+    await col.poll_once("a")  # 基线轮也拉取
+    recs = store.recent_anomalies("a", 10)
+    assert [r["id"] for r in recs] == [3, 2, 1]  # id 倒序（最新在前）
+    assert recs[0]["ill_type"] == "repetition"
+    assert recs[0]["model"] == "m2"
+    assert col._anomaly_since["a"] == 3
+    assert store.instance_stats("a").anomaly_feed == "ok"
+
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(4, []))]
+    col._client.anomaly_responses = [_anomalies_payload([
+        {"id": 4, "time": 4.0, "ill_type": 4, "model_name": "m"},
+    ])]
+    await col.poll_once("a")
+    recs = store.recent_anomalies("a", 10)
+    assert len(recs) == 4 and recs[0]["id"] == 4
+    # id 去重：重复推送不新增
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(5, []))]
+    col._client.anomaly_responses = [_anomalies_payload([
+        {"id": 4, "time": 4.0, "ill_type": 4, "model_name": "m"},
+        {"id": 5, "time": 5.0, "ill_type": 2, "model_name": "m"},
+    ])]
+    await col.poll_once("a")
+    recs = store.recent_anomalies("a", 10)
+    assert [r["id"] for r in recs][:2] == [5, 4]
+    assert len(recs) == 5
+
+
+async def test_poll_anomalies_feed_states():
+    store = _store()
+    col = _collector(store)
+    col._client = FakeClient()
+    col._instances = {"a": InstanceConfig(name="a", url="http://v:8000")}
+
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(1, []))]
+    col._client.anomaly_responses = [httpx.Response(404, text="not found")]
+    await col.poll_once("a")
+    assert store.instance_stats("a").anomaly_feed == "unavailable"
+
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(2, []))]
+    col._client.anomaly_responses = [_anomalies_payload([], enabled=False)]
+    await col.poll_once("a")
+    assert store.instance_stats("a").anomaly_feed == "disabled"
+
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(3, []))]
+    col._client.anomaly_responses = [httpx.Response(500, text="boom")]
+    await col.poll_once("a")
+    assert store.instance_stats("a").anomaly_feed == "unavailable"
+
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(4, []))]
+    col._client.anomaly_responses = [_anomalies_payload([
+        {"id": 9, "time": 9.0, "ill_type": 2, "model_name": "m"},
+    ])]
+    await col.poll_once("a")
+    assert store.instance_stats("a").anomaly_feed == "ok"
+    assert len(store.recent_anomalies("a", 10)) == 1
+
+
+async def test_poll_anomalies_counter_rollback_resets_since():
+    """实例侧编号回退（pkl 重建）→ 重置游标重新拉取。"""
+    store = _store()
+    col = _collector(store)
+    col._client = FakeClient()
+    col._instances = {"a": InstanceConfig(name="a", url="http://v:8000")}
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(1, []))]
+    col._client.anomaly_responses = [_anomalies_payload([
+        {"id": 10, "time": 10.0, "ill_type": 2, "model_name": "m"},
+    ])]
+    await col.poll_once("a")
+    assert col._anomaly_since["a"] == 10
+
+    col._client.responses = [httpx.Response(200, text=make_metrics_text(2, []))]
+    col._client.anomaly_responses = [_anomalies_payload([
+        {"id": 2, "time": 2.0, "ill_type": 2, "model_name": "m"},
+    ], latest=2)]
+    await col.poll_once("a")
+    assert col._anomaly_since["a"] == 2
+    assert any(r["id"] == 2 for r in store.recent_anomalies("a", 10))
+
+
+async def test_fetch_anomaly_detail_normalizes_fields():
+    store = _store()
+    col = _collector(store)
+    col._client = FakeClient()
+    col._instances = {"a": InstanceConfig(name="a", url="http://v:8000/")}
+    col._client.responses = []
+    col._client.anomaly_responses = [httpx.Response(200, json={
+        "id": 7, "time": 123.0, "ill_type": 2, "model_name": "m",
+        "prompt": [{"role": "user", "content": "q"}],
+        "text": "ans", "reasoning_content": "th",
+    })]
+    d = await col.fetch_anomaly_detail(col._instances["a"], 7)
+    assert d == {"id": 7, "ts": 123.0, "ill_type": "garbled", "model": "m",
+                 "prompt": [{"role": "user", "content": "q"}],
+                 "text": "ans", "reasoning_content": "th",
+                 "localization": None}
+
+    col._client.anomaly_responses = [httpx.Response(404, text="nf")]
+    with pytest.raises(PollError):
+        await col.fetch_anomaly_detail(col._instances["a"], 99)

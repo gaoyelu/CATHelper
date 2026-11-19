@@ -298,6 +298,36 @@ tbody tr:hover { background: #f8fafc; }
 
 .empty-row td { color: var(--gray); text-align: center; padding: 18px; }
 
+/* ---------------- 异常实例列表 + 异常详情页 ---------------- */
+.row-click { cursor: pointer; }
+.anomaly-meta { display: flex; flex-wrap: wrap; gap: 8px 28px; padding: 6px 2px; }
+.anomaly-meta-item { font-size: 13px; color: var(--text); }
+.anomaly-content { padding: 4px 2px; }
+.anomaly-pre {
+  margin: 0; padding: 12px 14px;
+  background: #f7f8fa; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 12.5px; line-height: 1.65; color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 420px; overflow: auto;
+}
+.anomaly-empty { color: var(--gray); font-size: 13px; padding: 8px 2px; }
+.anomaly-note { font-size: 12px; color: var(--text-secondary); padding: 6px 2px 2px; }
+
+/* 检出位置高亮（语义视图） */
+.anomaly-mark { padding: 0 1px; border-radius: 3px; }
+.anomaly-mark.hit {
+  background: #fde8e8; color: #b42318;
+  border-bottom: 2px solid #b42318; font-weight: 600; cursor: default;
+}
+.anomaly-mark.win {
+  background: #fef0c7; color: #7a4101;
+  border-bottom: 2px solid #d97706; cursor: default;
+}
+
+.pager { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.pager-info { font-size: 12px; color: var(--text-secondary); }
+.pager .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
 /* ---------------- 响应式 ---------------- */
 @media (max-width: 1200px) {
   .kpis { grid-template-columns: repeat(3, 1fr); }

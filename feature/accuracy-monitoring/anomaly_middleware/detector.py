@@ -24,7 +24,7 @@ topk 由参数 topk_n 传入，消除 self.topk 首次锁定问题。
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Tuple
 import numpy as np
 import yaml
@@ -47,6 +47,20 @@ def check_path_exists(path):
 class DetectionResult:
     is_ill: bool = False
     ill_type: int = 0
+    # 检出位置信息（design_anomaly_localization.md §5）：
+    # - hits: 生僻字逐 token 命中 [{idx, token_id, logp_top1, cats?, topk_ids?}]，
+    #   idx 为检测序列（排序后 top-1）中的绝对索引；
+    # - windows: 乱码/重复触发窗口 [{start, end, kind}]，end 为开区间。
+    # 全部为纯 Python 类型（可 pickle 跨进程返回）。
+    hits: List[Dict[str, Any]] = field(default_factory=list)
+    windows: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# localization 容量上限（防御异常形态输入，保证记录体积可控）
+MAX_HITS = 200
+MAX_WINDOWS = 50
+# 命中详情携带的 topk 候选数
+HIT_CANDIDATES = 5
 
 
 # 重复检测的内部计数器
@@ -240,7 +254,7 @@ class ILLDetector:
 
         # 1) 如果有词表信息,使用生僻字的检测方法
         if tk2cat is not None:
-            flag, rare_character_count = self._detect_rare_character(
+            flag, rare_character_count, _ = self._detect_rare_character(
                 window_token_ids, window_logprobs, tk2cat, vocab_size
             )
             if flag and rare_character_count / seq_len > self.garbled_window_ratio:
@@ -274,21 +288,38 @@ class ILLDetector:
         window_logprobs: np.ndarray,
         tk2cat: Dict[str, int],
         vocab_size: int,
-    ) -> Tuple[bool, int]:
+        *,
+        offset: int = 0,
+        collect: bool = False,
+    ) -> Tuple[bool, int, List[Dict[str, Any]]]:
+        """生僻字检测。
+
+        collect=True 时返回逐 token 命中详情（供 localization 落盘）；
+        hits idx = offset + 窗口内位置（检测序列绝对索引）。
+        """
         # 当tk2cat为None时，使用top1的logp < 阈值 来判定
         if tk2cat is None:
             # window_logprobs以已降序排列, window_logprobs[:, 0]表示取序列中 top1 的 logprob
             log_dims = np.where(window_logprobs[:, 0] < self.rare_top1_logp_thresh)[0]
-            return len(log_dims) != 0, len(log_dims)
+            hits: List[Dict[str, Any]] = []
+            if collect:
+                for d in log_dims:
+                    hits.append({
+                        "idx": int(offset + d),
+                        "token_id": int(window_token_ids[d, 0]),
+                        "logp_top1": float(window_logprobs[d, 0]),
+                    })
+            return len(log_dims) != 0, len(log_dims), hits
 
         dims = np.where(np.exp(window_logprobs).sum(-1) < self.rare_explogp_sum_thresh)[
             0
         ]  # 找出当前window里topk概率总和小于阈值的dims
 
         if dims.size == 0:
-            return False, 0
+            return False, 0, []
 
         cat_hit_count = 0
+        hits = []
         for dim in dims:
             categories = set(
                 tk2cat[str(int(item))] for item in window_token_ids[dim] if int(item) <= vocab_size
@@ -299,7 +330,18 @@ class ILLDetector:
             categories -= self._REMOVE_CATEGORIES
             if len(categories) > self.rare_cat_thresh:
                 cat_hit_count += 1
-        return cat_hit_count > 0, cat_hit_count
+                if collect:
+                    hits.append({
+                        "idx": int(offset + dim),
+                        "token_id": int(window_token_ids[dim, 0]),
+                        "logp_top1": float(window_logprobs[dim, 0]),
+                        "cats": sorted(categories),
+                        "topk_ids": [
+                            int(x) for x in
+                            window_token_ids[dim, :min(HIT_CANDIDATES, window_token_ids.shape[1])]
+                        ],
+                    })
+        return cat_hit_count > 0, cat_hit_count, hits
 
     # 【单窗口】 轨迹检测 n-grams
     def _trajectory_detector(self, window_logprobs: List[float], window_tokens: List[int]) -> bool:
@@ -342,7 +384,7 @@ class ILLDetector:
         window_logprobs: np.ndarray,
         window_tokens: List[int],
         count_res: RepetitionCounters,
-    ) -> Tuple[bool, RepetitionCounters]:
+    ) -> Tuple[bool, RepetitionCounters, Optional[str]]:
         # acf
         res_acf = self._acf_detector(window_logprobs)
         # 轨迹检测
@@ -356,13 +398,13 @@ class ILLDetector:
         elif res_traj:
             count_res.traj_only += 1
 
-        if (
-            count_res.both > self.multi_window_thresh
-            or count_res.acf_only > self.single_window_thresh
-            or count_res.traj_only > self.single_window_thresh
-        ):
-            return True, count_res
-        return False, count_res
+        if count_res.both > self.multi_window_thresh:
+            return True, count_res, "both"
+        if count_res.acf_only > self.single_window_thresh:
+            return True, count_res, "acf_only"
+        if count_res.traj_only > self.single_window_thresh:
+            return True, count_res, "traj_only"
+        return False, count_res, None
 
     def _sort_and_truncate_topk(
         self,
@@ -418,15 +460,19 @@ class ILLDetector:
             return DetectionResult(is_ill=True, ill_type=4)
 
         if len(tokens) < self.stride:  # 只检测生僻字
-            rare_flag, _ = self._detect_rare_character(token_ids, logprobs, tk2cat, vocab_size)
+            rare_flag, _, hits = self._detect_rare_character(
+                token_ids, logprobs, tk2cat, vocab_size, collect=True
+            )
             if rare_flag:
-                return DetectionResult(is_ill=True, ill_type=1)
+                return DetectionResult(is_ill=True, ill_type=1, hits=hits[:MAX_HITS])
             return DetectionResult()
 
         # 初始化状态
         self._garbled_count = 0
         rare_flag = 0
         repet_counters = RepetitionCounters()
+        hits: List[Dict[str, Any]] = []
+        windows: List[Dict[str, Any]] = []
 
         # 滑窗检测
         for start, window_tokens in self.sliding_window(tokens):
@@ -436,27 +482,57 @@ class ILLDetector:
             window_logprobs = logprobs[start:end]  # 包含 topk logprobs数据
             window_top1_logprobs = window_logprobs[:, 0]  # 包含 top1 logprobs数据
 
-            # 1) 生僻字
-            rare_in_window, _ = self._detect_rare_character(window_token_ids, window_logprobs, tk2cat, vocab_size)
+            # 1) 生僻字（逐窗口收集命中详情，供 localization）
+            rare_in_window, _, window_hits = self._detect_rare_character(
+                window_token_ids, window_logprobs, tk2cat, vocab_size,
+                offset=start, collect=True,
+            )
             rare_flag = rare_in_window or rare_flag  # 即使检出生僻字，也不停止
+            if window_hits:
+                hits.extend(window_hits)
 
-            # 2） 乱码
+            # 2） 乱码（记录触发窗口）
             garbled = self._detect_garbled(window_token_ids, window_logprobs, tk2cat, vocab_size)
+            if garbled:
+                windows.append({"start": int(start), "end": int(end), "kind": "garbled"})
             if self._update_garbled_state(garbled):
-                return DetectionResult(is_ill=True, ill_type=2)
+                return DetectionResult(
+                    is_ill=True, ill_type=2,
+                    hits=hits[:MAX_HITS], windows=windows[:MAX_WINDOWS],
+                )
 
             # 最后一个不完整的窗口小于阈值时跳过重复检测
             if len(window_top1_logprobs) < self.stride:
                 continue
 
-            # 3) 重复检测
-            flag_repet, repet_counters = self._detect_repetitions(window_top1_logprobs, window_tokens, repet_counters)
+            # 3) 重复检测（记录触发窗口）
+            flag_repet, repet_counters, repet_chain = self._detect_repetitions(
+                window_top1_logprobs, window_tokens, repet_counters
+            )
             if flag_repet:
-                return DetectionResult(is_ill=True, ill_type=3)
+                # 可视化口径：按触发链倒推到首个贡献窗口（连续阳性时近似重复起点），
+                # 仅影响高亮范围，不影响检出判定与返回时机
+                rollback_windows = (
+                    self.multi_window_thresh
+                    if repet_chain == "both"
+                    else self.single_window_thresh
+                )
+                windows.append({
+                    "start": int(max(0, start - rollback_windows * self.stride)),
+                    "end": int(end),
+                    "kind": "repet",
+                })
+                return DetectionResult(
+                    is_ill=True, ill_type=3,
+                    hits=hits[:MAX_HITS], windows=windows[:MAX_WINDOWS],
+                )
 
         # 当检查到最后，除生僻字外无其他异常，则返回生僻字异常
         if rare_flag:
-            return DetectionResult(is_ill=True, ill_type=1)
+            return DetectionResult(
+                is_ill=True, ill_type=1,
+                hits=hits[:MAX_HITS], windows=windows[:MAX_WINDOWS],
+            )
         return DetectionResult()
 
     # 批量处理多个请求

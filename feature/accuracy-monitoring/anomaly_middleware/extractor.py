@@ -333,6 +333,24 @@ def extract_completions_text_tokenids(data: Any) -> List[List[int]]:
     return results
 
 
+def extract_reasoning_field(obj: Any) -> Optional[str]:
+    """读取思维链字段（双键兼容）：新版 vLLM `reasoning` 优先，回退旧版 `reasoning_content`。
+
+    vLLM 新版已将思维链字段由 reasoning_content 改名为 reasoning；两个键都读以
+    兼容新旧版本服务端。仅字符串取值有效；对象缺失/类型不符返回 None。
+    双键并存时取 `reasoning`（新版语义，避免过渡期双发导致重复累积）。
+    """
+    if not isinstance(obj, dict):
+        return None
+    r = obj.get("reasoning")
+    if isinstance(r, str):
+        return r
+    rc = obj.get("reasoning_content")
+    if isinstance(rc, str):
+        return rc
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # 恢复（供客户端，按原始参数）
 # --------------------------------------------------------------------------- #
@@ -599,7 +617,7 @@ class SSEStreamProcessor:
                     c = delta.get("content")
                     if isinstance(c, str):
                         self._text_acc[cidx] = self._text_acc.get(cidx, "") + c
-                    rc = delta.get("reasoning_content")
+                    rc = extract_reasoning_field(delta)
                     if isinstance(rc, str):
                         self._reasoning_acc[cidx] = self._reasoning_acc.get(cidx, "") + rc
             else:

@@ -113,6 +113,65 @@ class AnomalyStore:
         with open(self.file_path, "wb") as f:
             pickle.dump(self._data, f)
 
+    async def ensure_loaded(self) -> None:
+        """只读访问前确保文件已载入（锁内、一次性；磁盘读经线程 offload）。
+
+        与 save() 首次同步同一份 _synced 标记：无论先发生读还是写，文件只载一次。
+        """
+        if not self.enabled:
+            return
+        async with self._lock:
+            if self._synced:
+                return
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._sync_first)
+
+    def list_meta_sync(
+        self, since_id: int = 0, limit: int = 200
+    ) -> "tuple[List[Dict[str, Any]], int]":
+        """读取 (id > since_id) 的最新 limit 条元数据（id 升序）+ 满足条件总数。
+
+        仅读内存镜像 _data（端点侧需先 await ensure_loaded()）。
+        返回 (records, total)；单条损坏（缺字段/类型错）跳过不中断。
+        """
+        if not self.enabled or not self._data:
+            return [], 0
+        keys = sorted(k for k in self._data if isinstance(k, int) and k > since_id)
+        total = len(keys)
+        take = keys[-limit:] if limit > 0 else keys
+        records: List[Dict[str, Any]] = []
+        for k in take:
+            rec = self._data.get(k)
+            if not isinstance(rec, dict):
+                continue
+            try:
+                ts = float(rec.get("time"))
+                ill = int(rec.get("ill_type"))
+            except (TypeError, ValueError):
+                continue
+            loc = rec.get("localization")
+            hit_count = 0
+            if isinstance(loc, dict):
+                try:
+                    hit_count = len(loc.get("hits") or []) + len(loc.get("windows") or [])
+                except TypeError:
+                    hit_count = 0
+            records.append({
+                "id": k,
+                "time": ts,
+                "ill_type": ill,
+                "model_name": str(rec.get("model_name") or "unknown"),
+                "hit_count": hit_count,
+            })
+        return records, total
+
+    def get_record_sync(self, aid: int) -> Optional[Dict[str, Any]]:
+        """按编号读取完整记录（仅内存镜像；不存在返回 None）。"""
+        if not self.enabled:
+            return None
+        rec = self._data.get(aid)
+        return rec if isinstance(rec, dict) else None
+
     async def save(self, record: Dict[str, Any]) -> int:
         """分配异常编号 + 落盘（若开启）。返回异常编号。
 

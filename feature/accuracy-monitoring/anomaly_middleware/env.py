@@ -11,6 +11,7 @@ from typing import Optional
 
 METRICS_PATH_DEFAULT = "/anomaly/metrics"
 CONFIG_PATH_DEFAULT = "/anomaly/config"
+ANOMALIES_PATH_DEFAULT = "/anomaly/anomalies"
 TOP_LOGPROBS_DEFAULT = 20
 MONITOR_RATE_DEFAULT = 1.0
 DETECTOR_WORKERS_DEFAULT = 4
@@ -59,6 +60,7 @@ class PluginConfig:
     enabled: bool = True
     top_logprobs: int = TOP_LOGPROBS_DEFAULT
     metrics_path: str = METRICS_PATH_DEFAULT
+    anomalies_path: str = ANOMALIES_PATH_DEFAULT
     monitor_rate: float = MONITOR_RATE_DEFAULT
     detector_workers: int = DETECTOR_WORKERS_DEFAULT
     tokenizer_model: Optional[str] = None
@@ -96,6 +98,7 @@ class PluginConfig:
             tokenizer_model=_env_str("VLLM_ANOMALY_TOKENIZER_MODEL"),
             save_path=save_path,
             config_path=_env_str("VLLM_ANOMALY_CONFIG_PATH") or CONFIG_PATH_DEFAULT,
+            anomalies_path=_env_str("VLLM_ANOMALY_ANOMALIES_PATH") or ANOMALIES_PATH_DEFAULT,
         )
 
 

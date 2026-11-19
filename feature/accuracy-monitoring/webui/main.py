@@ -13,9 +13,10 @@ import logging
 import os
 import pickle
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
@@ -23,19 +24,29 @@ from pydantic import BaseModel
 
 from .alerts import AlertEngine
 from .auth import AuthManager
-from .collector import Collector
+from .collector import Collector, PollError
 from .config import (
     CONFIG_PATH_DEFAULT,
     ConfigError,
     ConfigManager,
     ILL_TYPES,
     InstanceConfig,
+    ModelRerunConfig,
     WebUIConfig,
 )
 from .events import AnomalyEvent, EventSynthesizer, ill_type_name
+from .rerun import RerunManager
 from .store import Store, TrendEvent
 
 logger = logging.getLogger("webui.main")
+
+# webui.* 日志落地：uvicorn 默认不挂 root handler，不配置则全部丢失。
+# 宿主已配置（有 handler）时跳过，避免重复输出。
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 # 趋势时间窗白名单：1day / 7day / 30day（天计数，最多近一个月）
 TREND_WINDOWS: Dict[str, int] = {
@@ -117,9 +128,12 @@ class _SafeUnpickler(pickle.Unpickler):
 def parse_anomaly_pickle(data: bytes) -> "tuple[List[Dict[str, Any]], int]":
     """解析异常 pickle 字节为记录列表 + 跳过条数。
 
-    每条记录取 time/ill_type/model_name 三字段；缺字段或转换失败跳过。
+    每条记录取异常编号（int key）/time/ill_type/model_name 及展示字段
+    （prompt/text/reasoning_content）；缺字段或转换失败跳过。
     ill_type=0(normal) 与越界值跳过（非异常，不入趋势）。
-    返回的记录为 dict: {ts, ill_type(字符串名), model}。
+    返回的记录为 dict: {ts, ill_type(字符串名), model, prompt, text,
+    reasoning_content[, id]}；id 仅在 pkl key 为 int（非 bool）时携带，
+    供异常实例表格/详情联动。
     """
     try:
         raw = _SafeUnpickler(io.BytesIO(data))
@@ -133,7 +147,7 @@ def parse_anomaly_pickle(data: bytes) -> "tuple[List[Dict[str, Any]], int]":
 
     records: List[Dict[str, Any]] = []
     skipped = 0
-    for _key, rec in d.items():
+    for key, rec in d.items():
         if not isinstance(rec, dict):
             skipped += 1
             continue
@@ -151,7 +165,27 @@ def parse_anomaly_pickle(data: bytes) -> "tuple[List[Dict[str, Any]], int]":
         if name == "unknown":
             skipped += 1
             continue
-        records.append({"ts": ts, "ill_type": name, "model": model})
+        item: Dict[str, Any] = {
+            "ts": ts,
+            "ill_type": name,
+            "model": model,
+            "prompt": rec.get("prompt"),
+            "text": rec.get("text"),
+            "reasoning_content": rec.get("reasoning_content"),
+        }
+        # 检出位置定位数据（新版 pkl 携带；旧版缺失 → 不带，前端降级展示）
+        loc = rec.get("localization")
+        if isinstance(loc, dict):
+            item["localization"] = loc
+        else:
+            # 旧版 pkl：保留重跑输入大字段，供方案 B 首次点击详情时按需重跑定位
+            #（design_anomaly_localization.md §6.2 导入管道）
+            item["topk_logprobs"] = rec.get("topk_logprobs")
+            item["tokens_ids"] = rec.get("tokens_ids")
+            item["text_tokenid"] = rec.get("text_tokenid") or rec.get("text_tokenids")
+        if isinstance(key, int) and not isinstance(key, bool):
+            item["id"] = key
+        records.append(item)
     records.sort(key=lambda r: r["ts"])
     return records, skipped
 
@@ -225,6 +259,10 @@ class AppContext:
             alerts=self.alert_engine,
             poll_cfg=self.cfg.poll,
         )
+        # 方案 B：旧记录按需离线重跑定位（models 配置 + 仓库默认 detector.yaml）
+        self.rerun = RerunManager(dict(self.cfg.models))
+        self._rerun_inflight: Dict[Tuple[str, int], "asyncio.Task"] = {}
+        self._rerun_failed: "OrderedDict[Tuple[str, int], None]" = OrderedDict()
         self.lock = asyncio.Lock()
         self.reload_task: Optional[asyncio.Task] = None
 
@@ -279,6 +317,60 @@ class AppContext:
     def current_instances(self) -> Dict[str, InstanceConfig]:
         return {i.name: i for i in self.cm.last_config.instances}
 
+    # ------------------------------------------------------------------ #
+    # 方案 B：旧记录按需离线重跑定位（design_anomaly_localization.md §6.2）
+    # ------------------------------------------------------------------ #
+    async def ensure_localization(
+        self, instance: str, anomaly_id: int, detail: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """详情无 localization 时按需重跑（线程池执行，单飞 + 失败负缓存）。
+
+        - 重跑成功 → 写回详情 LRU 缓存并返回新 dict；
+        - 重跑失败/无位置产出 → 记入负缓存（首次点击后不再重试，重启后失效）。
+        """
+        if not isinstance(detail, dict) or detail.get("localization") is not None:
+            return detail
+        if detail.get("ill_type") == "nan_value":
+            return detail  # NaN 值级判定，无文本位置可重跑
+        key = (instance, int(anomaly_id))
+        if key in self._rerun_failed:
+            return detail
+        task = self._rerun_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                asyncio.to_thread(self.rerun.rerun_localization, detail)
+            )
+            self._rerun_inflight[key] = task
+        try:
+            loc = await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 重跑失败不阻断详情返回
+            logger.warning("离线重跑定位失败 instance=%s id=%s: %s", instance, anomaly_id, exc)
+            loc = None
+        finally:
+            self._rerun_inflight.pop(key, None)
+        if isinstance(loc, dict):
+            updated = dict(detail)
+            updated["localization"] = loc
+            self.store.put_anomaly_detail(instance, anomaly_id, updated)
+            logger.info(
+                "离线重跑定位完成 instance=%s id=%s mode=%s consistent=%s "
+                "sequence_ref=%s aligned_text=%s aligned_reasoning=%s "
+                "align_mode=%s note=[%s]",
+                instance, anomaly_id, loc.get("rerun_mode"), loc.get("consistent"),
+                loc.get("sequence_ref"), loc.get("aligned_text"),
+                loc.get("aligned_reasoning"), loc.get("align_mode"),
+                loc.get("rerun_note"),
+            )
+            return updated
+        # 负缓存（有界）：避免每次点击都重试注定失败的重跑
+        self._rerun_failed[key] = None
+        self._rerun_failed.move_to_end(key)
+        while len(self._rerun_failed) > 1000:
+            self._rerun_failed.popitem(last=False)
+        return detail
+
     def instance_response(self, inst: InstanceConfig) -> Dict[str, Any]:
         st = self.store.instance_stats(inst.name)
         if st is not None:
@@ -310,6 +402,7 @@ class AppContext:
             "by_type": by_type,
             "by_model": by_model,
             "models": models,
+            "anomaly_feed": st.anomaly_feed if st else "unknown",
         }
 
 
@@ -443,6 +536,53 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             }
             for e in c.store.events_for(name, n)
         ]
+
+    @app.get("/api/instances/{name}/anomalies", tags=["query"])
+    async def api_instance_anomalies(
+        name: str,
+        request: Request,
+        user: str = Depends(require_user),
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """实例异常实例列表（元数据，id 倒序；feed 为拉取通道状态）。"""
+        c: AppContext = request.app.state.ctx
+        if name not in c.current_instances():
+            raise HTTPException(status_code=404, detail=f"实例 {name} 不存在")
+        n = max(0, min(limit, 1000))
+        st = c.store.instance_stats(name)
+        return {
+            "instance": name,
+            "feed": st.anomaly_feed if st else "unknown",
+            "records": c.store.recent_anomalies(name, n),
+        }
+
+    @app.get("/api/instances/{name}/anomalies/{anomaly_id}", tags=["query"])
+    async def api_instance_anomaly_detail(
+        name: str, anomaly_id: int, request: Request, user: str = Depends(require_user)
+    ) -> Dict[str, Any]:
+        """单条异常详情：优先本地 LRU 缓存，未命中按需向实例拉取并缓存。
+
+        缓存/拉取结果无 localization（旧版记录）时，触发方案 B 离线重跑定位
+        （ensure_localization），结果写回详情缓存，每条只算一次。
+        """
+        c: AppContext = request.app.state.ctx
+        cur = c.current_instances()
+        if name not in cur:
+            raise HTTPException(status_code=404, detail=f"实例 {name} 不存在")
+        cached = c.store.get_anomaly_detail(name, anomaly_id)
+        if cached is not None:
+            return await c.ensure_localization(name, anomaly_id, cached)
+        st = c.store.instance_stats(name)
+        if st is not None and st.anomaly_feed == "disabled":
+            raise HTTPException(status_code=404, detail="该实例未开启异常保存，无异常详情")
+        try:
+            detail = await c.collector.fetch_anomaly_detail(
+                cur[name], anomaly_id, with_data=True
+            )
+        except PollError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        c.store.put_anomaly_detail(name, anomaly_id, detail)
+        return await c.ensure_localization(name, anomaly_id, detail)
 
     # ------------------------------------------------------------------ #
     # 实例管理端点（§8）
@@ -578,16 +718,48 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             )
             for r in records
         ]
-        cleared = c.store.apply_import(instance, anomaly_events, trend_events)
+        # 异常实例表格联动：带 int 编号的记录 → 元数据入表格 + 详情入本地库
+        #（导入时全量现场已在手，无需向实例回查；重复导入走覆盖回滚）
+        linked = [r for r in records if r.get("id") is not None]
+        anomaly_metas = []
+        for r in linked:
+            meta: Dict[str, Any] = {
+                "id": r["id"], "ts": r["ts"], "ill_type": r["ill_type"],
+                "model": r["model"], "source": "imported",
+            }
+            # 位置数（§6.3 列表增强）：从 localization 统计命中 + 触发窗口
+            loc = r.get("localization")
+            if isinstance(loc, dict):
+                hc = len(loc.get("hits") or []) + len(loc.get("windows") or [])
+                if hc:
+                    meta["hit_count"] = hc
+            anomaly_metas.append(meta)
+        anomaly_details = [
+            {"id": r["id"], "ts": r["ts"], "ill_type": r["ill_type"],
+             "model": r["model"], "prompt": r.get("prompt"),
+             "text": r.get("text"), "reasoning_content": r.get("reasoning_content"),
+             "localization": r.get("localization"),
+             # 旧版 pkl 的重跑输入大字段：保留进详情，供方案 B 首次点击时按需重跑定位
+             "topk_logprobs": r.get("topk_logprobs"),
+             "tokens_ids": r.get("tokens_ids"),
+             "text_tokenid": r.get("text_tokenid"),
+             "source": "imported"}
+            for r in linked
+        ]
+        cleared = c.store.apply_import(
+            instance, anomaly_events, trend_events,
+            anomaly_metas=anomaly_metas, anomaly_details=anomaly_details,
+        )
         logger.info(
-            "导入历史异常: instance=%s, 导入=%d, 跳过=%d, 覆盖旧=%d",
-            instance, len(anomaly_events), skipped, cleared,
+            "导入历史异常: instance=%s, 导入=%d, 跳过=%d, 覆盖旧=%d, 关联实例表=%d",
+            instance, len(anomaly_events), skipped, cleared, len(anomaly_metas),
         )
         return {
             "instance": instance,
             "imported": len(anomaly_events),
             "skipped": skipped,
             "cleared": cleared,
+            "anomalies_linked": len(anomaly_metas),
             "warning": warning,
         }
 

@@ -37,6 +37,7 @@ from .extractor import (
     extract_chat_text_tokenids,
     extract_completions_response,
     extract_completions_text_tokenids,
+    extract_reasoning_field,
     save_original_params,
     strip_chat_response,
     strip_completions_response,
@@ -79,6 +80,23 @@ class StaticTokenTextResolver:
         txt = txt if txt else None
         self._cache[tid] = txt
         return txt
+
+    def decode_ids(self, token_ids: Any) -> Optional[str]:
+        """组解码（best effort）：逐 id 查表拼接。
+
+        proxy 无 tokenizer，多字节字符的字节碎片表项拼接后仍不完整
+        （U+FFFD 碎片）；localization 按不完整单元处理（继续并组/失败计数），
+        最终走近似对齐或降级路径，不会产出错位高亮。
+        """
+        if not isinstance(token_ids, (list, tuple)) or not token_ids:
+            return None
+        parts: List[str] = []
+        for tid in token_ids:
+            t = self.resolve(tid)
+            if t is None:
+                return None
+            parts.append(t)
+        return "".join(parts)
 
 
 def _load_json_object(path: str, what: str) -> Dict[str, Any]:
@@ -316,7 +334,7 @@ class ProxyStreamProcessor:
                 for c in ch
             ]
             self._choice_reasonings = [
-                (c.get("message") or {}).get("reasoning_content")
+                extract_reasoning_field(c.get("message"))
                 if isinstance(c, dict) else None
                 for c in ch
             ]

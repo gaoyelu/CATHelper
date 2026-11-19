@@ -187,3 +187,171 @@ def test_alloc_ids_monotonic():
     assert ids == list(range(1, 6))
     aid = [st.alloc_alert_id() for _ in range(3)]
     assert aid == [1, 2, 3]
+
+
+# ------------------------------------------------------------------ #
+# query_trend_window：区间查询 + by_type/total 同源 + data_start/partial
+# ------------------------------------------------------------------ #
+def _trend_event(ts, instance, ill, source="live"):
+    from webui.store import TrendEvent
+
+    return TrendEvent(ts=ts, instance=instance, model="m", ill_type=ill, source=source)
+
+
+def test_query_trend_window_points_and_by_type_consistent():
+    st = _store()
+    st.append_trend_events([
+        _trend_event(100.0, "a", "garbled"),
+        _trend_event(200.0, "a", "garbled"),
+        _trend_event(300.0, "b", "nan_value"),
+    ], now=300.0)
+    r = st.query_trend_window(50.0, 350.0)
+    assert r["total"] == 3
+    assert r["by_type"] == {
+        "rare_character": 0, "garbled": 2, "repetition": 0, "nan_value": 1,
+    }
+    # 阶梯点与 by_type 同源：total == len(points) == by_type 求和
+    assert len(r["points"]) == r["total"] == sum(r["by_type"].values())
+    assert [p["cumulative"] for p in r["points"]] == [1, 2, 3]
+    assert r["data_start"] == 100.0
+    # start=50 早于 data_start=100 → 部分覆盖
+    assert r["partial"] is True
+    # 完全覆盖（start == data_start）→ 不置 partial
+    r2 = st.query_trend_window(100.0, 350.0)
+    assert r2["total"] == 3
+    assert r2["partial"] is False
+
+
+def test_query_trend_window_range_filter():
+    st = _store()
+    st.append_trend_events([
+        _trend_event(100.0, "a", "garbled"),
+        _trend_event(200.0, "a", "repetition"),
+        _trend_event(300.0, "a", "garbled"),
+    ], now=300.0)
+    r = st.query_trend_window(150.0, 250.0)
+    assert r["total"] == 1
+    assert r["by_type"]["repetition"] == 1
+    assert r["by_type"]["garbled"] == 0
+
+
+def test_query_trend_window_instance_filter():
+    st = _store()
+    st.append_trend_events([
+        _trend_event(100.0, "a", "garbled"),
+        _trend_event(200.0, "b", "nan_value"),
+    ], now=200.0)
+    r = st.query_trend_window(50.0, 350.0, instance="a")
+    assert r["total"] == 1
+    assert r["by_type"] == {
+        "rare_character": 0, "garbled": 1, "repetition": 0, "nan_value": 0,
+    }
+    assert all(p["instance"] == "a" for p in r["points"])
+
+
+def test_query_trend_window_partial_and_empty():
+    st = _store()
+    st.append_trend_events([_trend_event(1000.0, "a", "garbled")], now=1000.0)
+    # 部分交集：start 早于 data_start，仍返回区间内实际数据
+    r = st.query_trend_window(500.0, 1500.0)
+    assert r["partial"] is True
+    assert r["data_start"] == 1000.0
+    assert r["total"] == 1
+    # 完全无交集：空结果 + partial
+    r2 = st.query_trend_window(0.0, 999.0)
+    assert r2["partial"] is True
+    assert r2["total"] == 0
+    assert r2["points"] == []
+    # 区间晚于数据起点：不置 partial
+    r3 = st.query_trend_window(1000.0, 2000.0)
+    assert r3["partial"] is False
+
+
+def test_query_trend_window_empty_store():
+    st = _store()
+    r = st.query_trend_window(0.0, 100.0)
+    assert r["total"] == 0
+    assert r["data_start"] is None
+    assert r["partial"] is False
+    assert r["by_type"] == {
+        "rare_character": 0, "garbled": 0, "repetition": 0, "nan_value": 0,
+    }
+
+
+def test_query_trend_events_preset_thin_wrapper():
+    """预设窗口 = [now-window, now] 的薄封装，行为回归。"""
+    st = _store()
+    now = 10_000.0
+    st.append_trend_events([
+        _trend_event(now - 3600.0, "a", "garbled"),   # 窗口边界内（闭区间）
+        _trend_event(now - 7200.0, "a", "nan_value"),  # 1day 窗口外
+    ], now=now)
+    pts = st.query_trend_events(3600, now=now)
+    assert len(pts) == 1
+    assert pts[0]["ill_type"] == "garbled"
+    assert pts[0]["cumulative"] == 1
+
+
+def test_observe_models_independent_of_anomalies():
+    """metrics 观测模型名与异常无关：零异常在线实例也能记录。"""
+    st = _store()
+    st.observe_models("a", ["model-a", "model-a", ""])  # 去重 + 过滤空值
+    st.observe_models("a", ["model-b"])
+    stats = st.instance_stats("a")
+    assert stats.models_seen == {"model-a", "model-b"}
+    # 不影响异常计数口径
+    assert stats.anomalies == 0 and stats.by_model == {}
+    # 观测模型 ∪ 异常事件模型（导入校验用的并集口径）
+    st.observe_models("a", ["model-c"])
+    st.record_delta("a", _delta(1, [("garbled", "a", "model-d", "0")]))
+    stats = st.instance_stats("a")
+    assert (set(stats.by_model) | stats.models_seen) == {
+        "model-a", "model-b", "model-c", "model-d",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 异常实例：元数据环形缓冲 + 详情 LRU 缓存 + feed 状态
+# --------------------------------------------------------------------------- #
+def test_anomaly_meta_ring_dedupe_and_order():
+    st = _store(anomaly_capacity=3)
+    for i in range(1, 6):
+        assert st.add_anomaly_meta("a", {"id": i, "ts": float(i),
+                                         "ill_type": "garbled", "model": "m"})
+    # 容量淘汰最旧（5 条只留 3-5）
+    recs = st.recent_anomalies("a", 10)
+    assert [r["id"] for r in recs] == [5, 4, 3]
+    # id 去重：重复追加返回 False 且不新增
+    assert st.add_anomaly_meta("a", {"id": 5, "ts": 5.0,
+                                     "ill_type": "garbled", "model": "m"}) is False
+    assert len(st.recent_anomalies("a", 10)) == 3
+    # 未知实例为空列表
+    assert st.recent_anomalies("nope", 10) == []
+
+
+def test_anomaly_detail_lru_cache():
+    st = _store(anomaly_detail_cache=2)
+    for i in (1, 2, 3):
+        st.put_anomaly_detail("a", i, {"id": i, "text": f"t{i}"})
+    assert st.get_anomaly_detail("a", 3) == {"id": 3, "text": "t3"}
+    # 容量 2：1 被淘汰
+    assert st.get_anomaly_detail("a", 1) is None
+    # 重复 put 移到最新位置
+    st.put_anomaly_detail("a", 2, {"id": 2, "text": "t2-new"})
+    st.put_anomaly_detail("a", 4, {"id": 4, "text": "t4"})
+    assert st.get_anomaly_detail("a", 3) is None
+    assert st.get_anomaly_detail("a", 2) == {"id": 2, "text": "t2-new"}
+    assert st.get_anomaly_detail("a", 4) == {"id": 4, "text": "t4"}
+    # 实例隔离
+    assert st.get_anomaly_detail("b", 2) is None
+
+
+def test_anomaly_feed_state_and_purge():
+    st = _store()
+    st.set_anomaly_feed("a", "ok")
+    st.add_anomaly_meta("a", {"id": 1, "ts": 1.0, "ill_type": "garbled", "model": "m"})
+    st.put_anomaly_detail("a", 1, {"id": 1, "text": "t"})
+    st.purge_instance("a")
+    assert st.instance_stats("a") is None
+    assert st.recent_anomalies("a", 10) == []
+    assert st.get_anomaly_detail("a", 1) is None

@@ -54,6 +54,33 @@ def test_resolve_none_id_returns_none():
     assert r.resolve(None) is None  # type: ignore[arg-type]
 
 
+# --------------------------- decode_ids（组解码，localization 字节碎片合并） --------------------------- #
+def test_decode_ids_group_decode():
+    """多 id 一次 decode：字节碎片合并还原原字符（组解码语义）。"""
+    tok = FakeTok({1: "\ufffd", 2: "\ufffd", 3: "你", 4: "好"})
+    r = TokenTextResolver(tok)
+    # 单字节碎片（模拟）：decode([1]) == "\ufffd"
+    assert r.decode_ids([1]) == "\ufffd"
+    # 组解码：FakeTok 逐 id 拼接，模拟字节级 BPE 组解码还原完整字符
+    assert r.decode_ids([3, 4]) == "你好"
+    assert r.decode_ids((1, 2, 3)) == "\ufffd\ufffd你"
+
+
+def test_decode_ids_empty_and_invalid():
+    r = TokenTextResolver(FakeTok({1: "a"}))
+    assert r.decode_ids([]) is None
+    assert r.decode_ids("bad") is None  # type: ignore[arg-type]
+    assert r.decode_ids([1, -1]) is None  # 非法 id
+    assert r.decode_ids([1, "x"]) is None  # type: ignore[list-item]
+
+
+def test_decode_ids_decode_raises_returns_none():
+    tok = FakeTok({1: "a"}, raise_ids=[1])
+    r = TokenTextResolver(tok)
+    assert r.decode_ids([1]) is None
+    assert r.decode_ids([1, 2]) is None
+
+
 # --------------------------- acquire_tokenizer_sync --------------------------- #
 def test_acquire_tokenizer_sync_explicit_local(tmp_path, monkeypatch):
     """explicit(env) 本地目录命中 from_pretrained（local_files_only）。"""

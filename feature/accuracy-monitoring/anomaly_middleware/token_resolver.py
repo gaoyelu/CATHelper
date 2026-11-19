@@ -236,3 +236,55 @@ class TokenTextResolver:
             return None
         self._cache[tid] = s
         return s
+
+    def eos_token_ids(self) -> set:
+        """EOS token id 集合（tokenizer.eos_token_id ∪ generation_config.eos_token_id）。
+
+        供 localization 截掉解码重建文本尾部的 eos 标记（保存的 text 不含 eos，
+        不截掉会把短输出的相似度拉到对齐阈值之下）。
+        """
+        ids: set = set()
+
+        def _add(v: Any) -> None:
+            if isinstance(v, bool):
+                return
+            if isinstance(v, int):
+                ids.add(v)
+            elif isinstance(v, (list, tuple)):
+                for x in v:
+                    if isinstance(x, int) and not isinstance(x, bool):
+                        ids.add(x)
+
+        try:
+            _add(getattr(self._tok, "eos_token_id", None))
+        except Exception:
+            pass
+        try:
+            _add(getattr(getattr(self._tok, "generation_config", None), "eos_token_id", None))
+        except Exception:
+            pass
+        return ids
+
+    def decode_ids(self, token_ids: Any) -> Optional[str]:
+        """组解码：多 token 一起解码（localization 字节碎片合并专用）。
+
+        字节级 BPE（Qwen 等）会把多字节字符拆成多个字节 token，单 token 解码
+        只能得到 U+FFFD 碎片；整组 decode 可还原原字符，align_text 才能与
+        输出文本精确对齐。失败返回 None（调用方按不完整单元处理）。
+        """
+        if not isinstance(token_ids, (list, tuple)) or not token_ids:
+            return None
+        ids: List[int] = []
+        for tid in token_ids:
+            try:
+                v = int(tid)
+            except (TypeError, ValueError):
+                return None
+            if v < 0:
+                return None
+            ids.append(v)
+        try:
+            s = self._tok.decode(ids)
+        except Exception:
+            return None
+        return s if s else None
