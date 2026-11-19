@@ -908,7 +908,7 @@
     $('anomaly-title').textContent = '异常 #' + id;
     $('anomaly-ill-badge').innerHTML = '';
     $('anomaly-current-user').textContent = $('current-user').textContent || '';
-    ['anomaly-prompt', 'anomaly-reasoning', 'anomaly-text'].forEach(function (cid) {
+    ['anomaly-prompt', 'anomaly-text'].forEach(function (cid) {
       $(cid).innerHTML = '';
       $(cid).appendChild(el('div', 'anomaly-empty', '加载中…'));
     });
@@ -929,7 +929,7 @@
       var meta = $('anomaly-meta');
       meta.innerHTML = '';
       meta.appendChild(el('div', 'anomaly-empty', msg));
-      ['anomaly-prompt', 'anomaly-reasoning', 'anomaly-text'].forEach(function (cid) {
+      ['anomaly-prompt', 'anomaly-text'].forEach(function (cid) {
         $(cid).innerHTML = '';
       });
       return;
@@ -974,29 +974,46 @@
     $('anomaly-ill-badge').innerHTML = illTag(d.ill_type);
     fillAnomalySection('anomaly-prompt', promptToText(d.prompt), '（无 prompt 数据）');
 
-    // 思维链：按 reasoning_spans 高亮（后端按显示单元换算，未对齐时降级提示）。
-    // reasoning_end 为 null 说明思维链 token 不在 logprobs 序列内（无从对齐，
-    // 命中必在正文）——不提示，避免噪音。
-    // reasoning_content 缺失时用后端从 token 解码流提取的思维链（loc.reasoning_text）。
+    // 模型输出：思维链与正文合并到同一窗口（不区分区块），高亮区间按偏移平移。
+    // reasoning_content 缺失时用后端从 token 解码流提取的思维链（loc.reasoning_text）；
+    // 正文已包含思维链内容时不重复拼接（旧中间件 text 含 <think> 原文的场景）。
     var reasonText = d.reasoning_content || (loc && loc.reasoning_text) || '';
-    var reasonUnaligned = !!(loc && hitTotal > 0 && reasonText &&
-      loc.reasoning_end != null && !loc.aligned_reasoning);
-    fillAnomalySectionSpans('anomaly-reasoning', reasonText,
-      (loc && loc.reasoning_spans) || [], '（无思维链内容）', reasonUnaligned);
-
+    var answerText = d.text || '';
+    var SEP = '\n\n';
+    var dupReason = !!(reasonText && answerText && answerText.indexOf(reasonText) >= 0);
+    var showReason = !!(reasonText && !dupReason);
+    var combined = showReason
+      ? (answerText ? reasonText + SEP + answerText : reasonText)
+      : (answerText || reasonText);
+    var reasonOffset = 0;
+    var textOffset = (showReason && answerText) ? reasonText.length + SEP.length : 0;
+    var spans = [];
+    if (showReason) {
+      ((loc && loc.reasoning_spans) || []).forEach(function (s) {
+        spans.push({ start: s.start + reasonOffset, end: s.end + reasonOffset,
+                     kind: s.kind, title: s.title });
+      });
+    }
+    ((loc && loc.text_spans) || []).forEach(function (s) {
+      spans.push({ start: s.start + textOffset, end: s.end + textOffset,
+                   kind: s.kind, title: s.title });
+    });
+    // reasoning_end 为 null 说明思维链 token 不在 logprobs 序列内（无从对齐，
+    // 命中必在正文）——该侧不提示，避免噪音。
+    var unaligned = !!(loc && hitTotal > 0 && combined &&
+      ((showReason && loc.reasoning_end != null && !loc.aligned_reasoning) ||
+       (answerText && !loc.aligned_text)));
     var textBox = $('anomaly-text');
     if (!loc) {
       // 旧版记录：无位置信息，保持原样展示 + 提示
-      fillAnomalySection('anomaly-text', d.text || '', '（无输出文本）');
+      fillAnomalySection('anomaly-text', combined, '（无输出内容）');
       if (POSITION_ILL_TYPES[d.ill_type]) {
         textBox.appendChild(el('div', 'anomaly-note',
           '（该记录无检出位置信息：实例中间件或导入的 pkl 为旧版本，升级后新检出的异常将附带位置高亮）'));
       }
       return;
     }
-    var textUnaligned = !!(hitTotal > 0 && d.text && !loc.aligned_text);
-    fillAnomalySectionSpans('anomaly-text', d.text || '',
-      (loc && loc.text_spans) || [], '（无输出文本）', textUnaligned);
+    fillAnomalySectionSpans('anomaly-text', combined, spans, '（无输出内容）', unaligned);
   }
 
   function closeAnomalyDetail() {
