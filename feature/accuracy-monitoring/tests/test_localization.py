@@ -597,3 +597,54 @@ def test_text_prefix_with_extra_suffix_aligned():
     assert loc["aligned_text"] is True
     assert loc["align_mode"] == "exact"
     assert loc["text_spans"][0]["start"] == 1
+
+
+# --------------------------- 全量 text（含思维链原文）的包含定位 --------------------------- #
+def test_full_text_containing_reasoning_answer_segment():
+    """text 为全量输出（思维链+正文，无标记）：正文段内嵌于 text → 包含定位映射。
+
+    场景：reasoning_content='思考'、text='思考答案'（旧中间件未拆分）。
+    命中在思维链 → reasoning_spans（保存 reasoning 坐标）；
+    命中在正文 → text_spans 映射到全量 text 坐标（前端无需偏移）。
+    """
+    resolver = FakeResolver({1: "思", 2: "考", 3: "答", 4: "案"})
+    loc = build_localization(
+        ill_type=1,
+        hits=[
+            {"idx": 0, "token_id": 1, "logp_top1": -7.0},  # 思维链内
+            {"idx": 3, "token_id": 4, "logp_top1": -7.5},  # 正文内
+        ],
+        windows=[],
+        tokenids=[1, 2, 3, 4],
+        text="思考答案",
+        reasoning_content="思考",
+        resolver=resolver,
+        seq_len=4,
+    )
+    assert loc["aligned_text"] is True
+    assert loc["aligned_reasoning"] is True
+    assert loc["reasoning_spans"][0]["start"] == 0       # 相对 reasoning_content
+    # 正文命中映射到全量 text 绝对坐标（'案' 在 text[3]）
+    assert loc["text_spans"][0]["start"] == 3
+    assert loc["text_spans"][0]["end"] == 4
+
+
+def test_full_text_with_markers_containing_reasoning():
+    """text 含 <think> 标记原文：正文段包含定位映射到全量坐标。"""
+    resolver = FakeResolver(
+        {1: "<think>", 2: "思", 3: "考", 4: "</think>", 5: "答", 6: "案"}
+    )
+    loc = build_localization(
+        ill_type=1,
+        hits=[{"idx": 4, "token_id": 5, "logp_top1": -7.0}],
+        windows=[],
+        tokenids=[1, 2, 3, 4, 5, 6],
+        text="<think>思考</think>答案",
+        reasoning_content="思考",
+        resolver=resolver,
+        seq_len=6,
+    )
+    assert loc["aligned_text"] is True
+    # 正文命中映射到全量 text 绝对坐标（'答' 在 text[17]，跳过标记与思维链）
+    assert loc["text_spans"][0]["start"] == 17
+    assert loc["text_spans"][0]["end"] == 18

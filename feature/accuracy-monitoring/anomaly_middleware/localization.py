@@ -482,8 +482,13 @@ def build_localization(
         loc["reasoning_end"] = reasoning_end
 
         # ---- 区块对齐判定（精确一致 → 近似映射 → 降级） ---- #
+        # text 可能为全量输出（含思维链原文，旧中间件/未拆分场景）：
+        # - 精确/前缀：正文段与 text 完全一致或为 text 前缀；
+        # - 全量一致：align_text 与 text 完全一致（text 含思维链原文）→ 绝对坐标映射；
+        # - 包含定位：正文段内嵌于 text（text = 思维链 + 正文）→ difflib 覆盖率定位，
+        #   text_spans 直接映射到全量 text 坐标（前端无需再偏移）。
         text_str = text if isinstance(text, str) else None
-        text_blocks: Optional[List[Tuple[int, int, int]]] = None  # 正文重建→保存 text 映射块
+        text_blocks: Optional[List[Tuple[int, int, int]]] = None  # 正文段→全量 text 映射块
         aligned_text = False
         if text_str is not None:
             src_seg = align_text[text_start:]
@@ -492,11 +497,18 @@ def build_localization(
             elif text_str and src_seg.startswith(text_str):
                 # 重建尾部多出内容（未被识别的 EOS/结束标记）：正文为精确前缀
                 aligned_text = True
-            else:
-                tb = _approx_blocks(src_seg, text_str)
-                if tb is not None:
+            elif align_text == text_str:
+                # text 为全量输出（含思维链原文）：正文段对应 text[text_start:]，绝对坐标映射
+                aligned_text = True
+                if text_start:
+                    text_blocks = [(0, text_start, len(src_seg))]
+            elif src_seg:
+                located = _locate_approx(text_str, src_seg)
+                if located:
+                    blocks, _s, _e = located
+                    # (hay=text 坐标, needle=正文段坐标, size) → 反转为 (src, dst, size)
+                    text_blocks = [(b[1], b[0], b[2]) for b in blocks]
                     aligned_text = True
-                    text_blocks = tb
                     loc["align_mode"] = "approx"
         if rc_blocks is not None:
             loc["align_mode"] = "approx"

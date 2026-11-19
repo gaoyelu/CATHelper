@@ -975,23 +975,31 @@
     fillAnomalySection('anomaly-prompt', promptToText(d.prompt), '（无 prompt 数据）');
 
     // 模型输出：思维链与正文合并到同一窗口（不区分区块），高亮区间按偏移平移。
-    // reasoning_content 缺失时用后端从 token 解码流提取的思维链（loc.reasoning_text）；
-    // 正文已包含思维链内容时不重复拼接（旧中间件 text 含 <think> 原文的场景）。
+    // reasoning_content 缺失时用后端从 token 解码流提取的思维链（loc.reasoning_text）。
+    // 正文已包含思维链内容（dupReason，旧中间件 text 为全量输出）时：
+    // - 不重复拼接，combined = 全量 text；
+    // - reasoning_spans 不丢弃，按思维链在前缀中的位置平移到全量文本渲染；
+    // - text_spans 由后端包含定位直接映射到全量 text 坐标（textOffset=0）。
     var reasonText = d.reasoning_content || (loc && loc.reasoning_text) || '';
     var answerText = d.text || '';
     var SEP = '\n\n';
-    var dupReason = !!(reasonText && answerText && answerText.indexOf(reasonText) >= 0);
+    var reasonPos = (reasonText && answerText) ? answerText.indexOf(reasonText) : -1;
+    var dupReason = reasonPos >= 0;
     var showReason = !!(reasonText && !dupReason);
     var combined = showReason
       ? (answerText ? reasonText + SEP + answerText : reasonText)
       : (answerText || reasonText);
-    var reasonOffset = 0;
     var textOffset = (showReason && answerText) ? reasonText.length + SEP.length : 0;
     var spans = [];
+    if (dupReason) {
+      ((loc && loc.reasoning_spans) || []).forEach(function (s) {
+        spans.push({ start: s.start + reasonPos, end: s.end + reasonPos,
+                     kind: s.kind, title: s.title });
+      });
+    }
     if (showReason) {
       ((loc && loc.reasoning_spans) || []).forEach(function (s) {
-        spans.push({ start: s.start + reasonOffset, end: s.end + reasonOffset,
-                     kind: s.kind, title: s.title });
+        spans.push({ start: s.start, end: s.end, kind: s.kind, title: s.title });
       });
     }
     ((loc && loc.text_spans) || []).forEach(function (s) {
