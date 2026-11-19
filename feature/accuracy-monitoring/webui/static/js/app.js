@@ -979,7 +979,7 @@
     // 正文已包含思维链内容（dupReason，旧中间件 text 为全量输出）时：
     // - 不重复拼接，combined = 全量 text；
     // - reasoning_spans 不丢弃，按思维链在前缀中的位置平移到全量文本渲染；
-    // - text_spans 由后端包含定位直接映射到全量 text 坐标（textOffset=0）。
+    // - text_spans 补偿后端下发的 text_answer_offset（正文段在全量 text 中的起点）。
     var reasonText = d.reasoning_content || (loc && loc.reasoning_text) || '';
     var answerText = d.text || '';
     var SEP = '\n\n';
@@ -990,6 +990,7 @@
       ? (answerText ? reasonText + SEP + answerText : reasonText)
       : (answerText || reasonText);
     var textOffset = (showReason && answerText) ? reasonText.length + SEP.length : 0;
+    var textAnswerOffset = (loc && loc.text_answer_offset) || 0;
     var spans = [];
     if (dupReason) {
       ((loc && loc.reasoning_spans) || []).forEach(function (s) {
@@ -1003,7 +1004,8 @@
       });
     }
     ((loc && loc.text_spans) || []).forEach(function (s) {
-      spans.push({ start: s.start + textOffset, end: s.end + textOffset,
+      spans.push({ start: s.start + textOffset + textAnswerOffset,
+                   end: s.end + textOffset + textAnswerOffset,
                    kind: s.kind, title: s.title });
     });
     // reasoning_end 为 null 说明思维链 token 不在 logprobs 序列内（无从对齐，

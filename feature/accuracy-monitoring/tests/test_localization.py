@@ -601,11 +601,11 @@ def test_text_prefix_with_extra_suffix_aligned():
 
 # --------------------------- 全量 text（含思维链原文）的包含定位 --------------------------- #
 def test_full_text_containing_reasoning_answer_segment():
-    """text 为全量输出（思维链+正文，无标记）：正文段内嵌于 text → 包含定位映射。
+    """text 为全量输出（思维链+正文，无标记）：先切出正文段再比，offset 随 loc 下发。
 
     场景：reasoning_content='思考'、text='思考答案'（旧中间件未拆分）。
     命中在思维链 → reasoning_spans（保存 reasoning 坐标）；
-    命中在正文 → text_spans 映射到全量 text 坐标（前端无需偏移）。
+    命中在正文 → text_spans 为切出正文段坐标，text_answer_offset=2 供前端补偿。
     """
     resolver = FakeResolver({1: "思", 2: "考", 3: "答", 4: "案"})
     loc = build_localization(
@@ -624,13 +624,14 @@ def test_full_text_containing_reasoning_answer_segment():
     assert loc["aligned_text"] is True
     assert loc["aligned_reasoning"] is True
     assert loc["reasoning_spans"][0]["start"] == 0       # 相对 reasoning_content
-    # 正文命中映射到全量 text 绝对坐标（'案' 在 text[3]）
-    assert loc["text_spans"][0]["start"] == 3
-    assert loc["text_spans"][0]["end"] == 4
+    # 正文命中为切出正文段内坐标（'案' 在正文段[1]），偏移由 text_answer_offset 下发
+    assert loc["text_spans"][0]["start"] == 1
+    assert loc["text_spans"][0]["end"] == 2
+    assert loc["text_answer_offset"] == 2
 
 
 def test_full_text_with_markers_containing_reasoning():
-    """text 含 <think> 标记原文：正文段包含定位映射到全量坐标。"""
+    """text 含 <think> 标记原文：按 </think> 切出正文段，offset=17。"""
     resolver = FakeResolver(
         {1: "<think>", 2: "思", 3: "考", 4: "</think>", 5: "答", 6: "案"}
     )
@@ -645,6 +646,28 @@ def test_full_text_with_markers_containing_reasoning():
         seq_len=6,
     )
     assert loc["aligned_text"] is True
-    # 正文命中映射到全量 text 绝对坐标（'答' 在 text[17]，跳过标记与思维链）
-    assert loc["text_spans"][0]["start"] == 17
-    assert loc["text_spans"][0]["end"] == 18
+    assert loc["text_spans"][0]["start"] == 0            # 切出正文段内坐标
+    assert loc["text_spans"][0]["end"] == 1
+    assert loc["text_answer_offset"] == 17               # '答' 在全量 text[17]
+
+
+def test_approx_threshold_lowered_to_0_7():
+    """相似度 0.85（介于旧阈值 0.9 与新阈值 0.7 之间）：近似对齐可用。"""
+    align = _CHARS
+    # 3 个字符被替换：ratio = 2*17/40 = 0.85
+    saved = (_CHARS[:3] + "XYZ" + _CHARS[6:12] + "KQV" + _CHARS[15:])
+    assert len(saved) == len(align)
+    loc = build_localization(
+        ill_type=1,
+        hits=[{"idx": 1, "token_id": 2, "logp_top1": -7.0}],
+        windows=[],
+        tokenids=list(range(1, 21)),
+        text=saved,
+        reasoning_content=None,
+        resolver=_seq_resolver(),
+        seq_len=20,
+    )
+    assert loc["aligned_text"] is True
+    assert loc["align_mode"] == "approx"
+    assert loc["text_answer_offset"] == 0
+    assert loc["text_spans"][0]["start"] == 1

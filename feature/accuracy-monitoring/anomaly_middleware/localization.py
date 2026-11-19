@@ -41,7 +41,8 @@ MAX_HIT_CANDIDATES = 5
 ALIGN_FAIL_RATIO = 0.2
 
 # 近似对齐：字符相似度低于该值视为无法对齐；文本超过该长度不做模糊映射（性能兜底）
-APPROX_ALIGN_RATIO = 0.9
+# 用户口径：高亮允许误差，只要大范围一致即可 → 阈值放宽到 0.7
+APPROX_ALIGN_RATIO = 0.7
 APPROX_ALIGN_MAX_CHARS = 20000
 
 # 单元合并的 token 数上限（防御原文自带 U+FFFD/坏数据导致组无限延伸；
@@ -327,6 +328,21 @@ def _hit_tooltip_fields(hit: Dict[str, Any]) -> str:
     return " · ".join(parts)
 
 
+def _locate_answer_cut(text_str: str, rc: Optional[str]) -> Optional[int]:
+    """定位全量 text 中正文段的起点（切分位置）。
+
+    text 可能为全量输出（含思维链前缀，旧中间件/未拆分场景）：
+    优先 </think> 结束标记；其次思维链原文之后。找不到返回 None。
+    """
+    if THINK_END in text_str:
+        return text_str.find(THINK_END) + len(THINK_END)
+    if rc:
+        p = text_str.find(rc)
+        if p >= 0:
+            return p + len(rc)
+    return None
+
+
 def build_localization(
     *,
     ill_type: int,
@@ -363,6 +379,7 @@ def build_localization(
         "aligned_reasoning": False,
         "align_mode": "exact",  # exact=完全一致 | approx=difflib 近似映射
         "reasoning_text": None,  # reasoning_content 缺失时从 token 流提取的思维链文本
+        "text_answer_offset": 0,  # 正文段在全量 text 中的起点（前端渲染 text_spans 的偏移）
     }
     try:
         clean_hits = _sanitize_hits(hits, seq_len)
@@ -481,15 +498,15 @@ def build_localization(
             loc["reasoning_text"] = reasoning_text_extracted
         loc["reasoning_end"] = reasoning_end
 
-        # ---- 区块对齐判定（精确一致 → 近似映射 → 降级） ---- #
-        # text 可能为全量输出（含思维链原文，旧中间件/未拆分场景）：
-        # - 精确/前缀：正文段与 text 完全一致或为 text 前缀；
-        # - 全量一致：align_text 与 text 完全一致（text 含思维链原文）→ 绝对坐标映射；
-        # - 包含定位：正文段内嵌于 text（text = 思维链 + 正文）→ difflib 覆盖率定位，
-        #   text_spans 直接映射到全量 text 坐标（前端无需再偏移）。
+        # ---- 区块对齐判定（先切分、再比较；精确一致 → 近似映射 → 降级） ---- #
+        # 对齐策略：先从 text 中切出正文段（</think> 之后 / 思维链原文之后），
+        # 再将解码正文段与切出的 text 正文段比较（精确/前缀/近似）。
+        # text_answer_offset = 正文段在全量 text 中的起点，随 loc 下发：
+        # 前端渲染 text_spans 时按它补偿偏移，保证 span + offset = 全量 text 坐标。
         text_str = text if isinstance(text, str) else None
-        text_blocks: Optional[List[Tuple[int, int, int]]] = None  # 正文段→全量 text 映射块
+        text_blocks: Optional[List[Tuple[int, int, int]]] = None  # 正文段→text 映射块
         aligned_text = False
+        text_answer_offset = 0
         if text_str is not None:
             src_seg = align_text[text_start:]
             if src_seg == text_str:
@@ -497,24 +514,39 @@ def build_localization(
             elif text_str and src_seg.startswith(text_str):
                 # 重建尾部多出内容（未被识别的 EOS/结束标记）：正文为精确前缀
                 aligned_text = True
-            elif align_text == text_str:
-                # text 为全量输出（含思维链原文）：正文段对应 text[text_start:]，绝对坐标映射
-                aligned_text = True
-                if text_start:
-                    text_blocks = [(0, text_start, len(src_seg))]
-            elif src_seg:
-                located = _locate_approx(text_str, src_seg)
-                if located:
-                    blocks, _s, _e = located
-                    # (hay=text 坐标, needle=正文段坐标, size) → 反转为 (src, dst, size)
-                    text_blocks = [(b[1], b[0], b[2]) for b in blocks]
+            else:
+                cut = _locate_answer_cut(text_str, rc)
+                if cut is not None:
+                    text_seg = text_str[cut:]
+                    if text_seg == src_seg or (src_seg and text_seg.startswith(src_seg)):
+                        aligned_text = True
+                        text_answer_offset = cut
+                    elif src_seg:
+                        tb = _approx_blocks(src_seg, text_seg)
+                        if tb is not None:
+                            aligned_text = True
+                            text_answer_offset = cut
+                            loc["align_mode"] = "approx"
+                            text_blocks = tb  # dst 为切出正文段内坐标，叠加 offset 后即全量坐标
+                elif align_text == text_str:
+                    # 全量一致（text 含思维链原文且无独立标记差异）：绝对坐标
                     aligned_text = True
-                    loc["align_mode"] = "approx"
+                    text_answer_offset = text_start
+                elif src_seg:
+                    # 兜底：无切分标记时按包含关系模糊定位（块坐标已是全量 text 坐标）
+                    located = _locate_approx(text_str, src_seg)
+                    if located:
+                        blocks, _s, _e = located
+                        # (hay=text 坐标, needle=正文段坐标, size) → 反转为 (src, dst, size)
+                        text_blocks = [(b[1], b[0], b[2]) for b in blocks]
+                        aligned_text = True
+                        loc["align_mode"] = "approx"
         if rc_blocks is not None:
             loc["align_mode"] = "approx"
         aligned_reasoning = rc_start is not None
         loc["aligned_text"] = aligned_text
         loc["aligned_reasoning"] = aligned_reasoning
+        loc["text_answer_offset"] = text_answer_offset
 
         # ---- 高亮区间换算（仅对齐区块；命中/窗口按 token 索引映射到单元） ---- #
         def _char_range(u_start: int, u_end: int) -> Optional[tuple]:
